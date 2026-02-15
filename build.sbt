@@ -20,16 +20,14 @@ lazy val root = project
       "ch.contrafactus" %% "dimwit-nn" % "0.1.0-SNAPSHOT" changing ()
     ),
     Compile / resourceDirectory := baseDirectory.value / "src" / "main" / "resources",
-    javaOptions ++= {
-      if (sys.props("os.name").toLowerCase.contains("mac")) {
-        Seq("-XstartOnFirstThread") // For MacOS to run Python with GUI support
-      } else {
-        Seq.empty
-      }
-    }
+    javaOptions ++= Seq(
+      // "-XX:G1PeriodicGCInterval=1000"
+      "-XX:+UseZGC",
+      "-XX:ZCollectionInterval=1" // Forces a GC cycle every 1 second, regardless of heap usage
+    )
   )
 
-fork := true
-
 // Ensure local ivy resolver is included
+fork := true
 resolvers += Resolver.defaultLocal
+envVars ++= sys.env

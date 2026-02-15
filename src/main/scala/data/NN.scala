@@ -7,6 +7,7 @@ import dimwit.jax.Jax
 import me.shadaj.scalapy.py
 import me.shadaj.scalapy.py.SeqConverters
 import nn.Conv2DLayer
+import dimwit.stats.Normal
 
 object Util:
   def vmap[T <: Tuple: Labels, T2 <: Tuple: Labels, L: Label, V](axis: Axis[L])(f: (Tensor[T, V] => Tensor[T2, V])): Tensor[L *: T, V] => Tensor[L *: T2, V] =
@@ -25,11 +26,20 @@ object Util:
         ta.fromPyTree(pyList.bracketAccess(i))
 
 import Util.vmap
+import resplan.data as Context
+import resplan.data as Embedding
 
 case class LayerNormalizationParams[L](
     weight: Tensor1[L, Float],
     bias: Tensor1[L, Float]
 )
+
+object LayerNormalizationParams:
+  def init[L: Label](ae: AxisExtent[L]) =
+    LayerNormalizationParams(
+      weight = Tensor(Shape(ae)).fill(1f),
+      bias = Tensor(Shape(ae)).fill(0f)
+    )
 
 case class LinearLayerParams[In, Out](
     weight: Tensor2[In, Out, Float],
@@ -39,6 +49,11 @@ case class LinearLayerParams[In, Out](
 case class ProjectionLayerParams[In, Out](
     weight: Tensor2[In, Out, Float]
 )
+object ProjectionLayerParams:
+  def init[In: Label, Out: Label](key: Random.Key, inExtent: AxisExtent[In], outExtent: AxisExtent[Out]): ProjectionLayerParams[In, Out] =
+    ProjectionLayerParams(
+      weight = Normal.standardIsotropic(Shape(inExtent, outExtent), scale = 0.02f).sample(key)
+    )
 
 case class HeadsParams[Kind, Embedding](val weights: Tensor3[Head, Embedding, Kind, Float])
 
@@ -49,17 +64,53 @@ case class MultiHeadAttentionParams[Embedding](
     proj: LinearLayerParams[Head |*| HeadValue, Embedding]
 )
 
+object MultiHeadAttentionParams:
+  def init[Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[Embedding]): MultiHeadAttentionParams[Embedding] =
+    MultiHeadAttentionParams(
+      wq = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headQueryExtent), scale = 0.02f).sample(key)),
+      wk = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headKeyExtent), scale = 0.02f).sample(key)),
+      wv = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headValueExtent), scale = 0.02f).sample(key)),
+      proj = LinearLayerParams(
+        weight = Normal.standardIsotropic(Shape(headExtent * headValueExtent, embeddingExtent), scale = 0.02f).sample(key),
+        bias = Tensor(Shape(embeddingExtent)).fill(0f)
+      )
+    )
+
 case class MultiHeadCrossAttentionParams[CrossEmbedding, Embedding](
     wq: HeadsParams[HeadQuery, Embedding],
     wk: HeadsParams[HeadKey, CrossEmbedding],
     wv: HeadsParams[HeadValue, CrossEmbedding],
     proj: LinearLayerParams[Head |*| HeadValue, Embedding]
 )
+object MultiHeadCrossAttentionParams:
+  def init[CrossEmbedding: Label, Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CrossEmbedding], embeddingExtent: AxisExtent[Embedding]): MultiHeadCrossAttentionParams[CrossEmbedding, Embedding] =
+    MultiHeadCrossAttentionParams(
+      wq = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headQueryExtent), scale = 0.02f).sample(key)),
+      wk = HeadsParams(Normal.standardIsotropic(Shape(headExtent, crossEmbeddingExtent, headKeyExtent), scale = 0.02f).sample(key)),
+      wv = HeadsParams(Normal.standardIsotropic(Shape(headExtent, crossEmbeddingExtent, headValueExtent), scale = 0.02f).sample(key)),
+      proj = LinearLayerParams(
+        weight = Normal.standardIsotropic(Shape(headExtent * headValueExtent, embeddingExtent), scale = 0.02f).sample(key),
+        bias = Tensor(Shape(embeddingExtent)).fill(0f)
+      )
+    )
 
 case class EmbeddingMixerParams[Embedding](
     c_fc: LinearLayerParams[Embedding, EmbeddingMixed],
     c_proj: LinearLayerParams[EmbeddingMixed, Embedding]
 )
+object EmbeddingMixerParams:
+  def init[Embedding: Label](key: Random.Key, embeddingExtent: AxisExtent[Embedding], embeddingMixedExtent: AxisExtent[EmbeddingMixed]): EmbeddingMixerParams[Embedding] =
+    val (fcKey, projKey) = key.split2()
+    EmbeddingMixerParams(
+      c_fc = LinearLayerParams(
+        weight = Normal.standardIsotropic(Shape(embeddingExtent, embeddingMixedExtent), scale = 0.02f).sample(fcKey),
+        bias = Tensor(Shape(embeddingMixedExtent)).fill(0f)
+      ),
+      c_proj = LinearLayerParams(
+        weight = Normal.standardIsotropic(Shape(embeddingMixedExtent, embeddingExtent), scale = 0.02f).sample(projKey),
+        bias = Tensor(Shape(embeddingExtent)).fill(0f)
+      )
+    )
 
 case class TransformerLayerParams[Embedding](
     ln1: LayerNormalizationParams[Embedding],
@@ -67,6 +118,16 @@ case class TransformerLayerParams[Embedding](
     ln2: LayerNormalizationParams[Embedding],
     embeddingMixer: EmbeddingMixerParams[Embedding]
 )
+
+object TransformerLayerParams:
+  def init[E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[EmbeddingMixed]): TransformerLayerParams[E] =
+    val (attnKey, mixKey) = key.split2()
+    TransformerLayerParams[E](
+      ln1 = LayerNormalizationParams.init(embeddingExtent),
+      attn = MultiHeadAttentionParams.init(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent),
+      ln2 = LayerNormalizationParams.init(embeddingExtent),
+      embeddingMixer = EmbeddingMixerParams.init(mixKey, embeddingExtent, embeddingMixedExtent)
+    )
 
 case class CrossTransformerLayerParams[CrossEmbedding, Embedding](
     crossAttentionPreNormalization: LayerNormalizationParams[Embedding],
@@ -77,6 +138,12 @@ case class CrossTransformerLayerParams[CrossEmbedding, Embedding](
 case class ViTPatchingParams(
     projectionWeights: Tensor[(Width, Height, Channel, EncoderEmbedding), Float]
 )
+
+object ViTPatchingParams:
+  def init(key: Random.Key, patchWidthExtent: AxisExtent[Width], patchHeightExtent: AxisExtent[Height], channelExtent: AxisExtent[Channel], embeddingExtent: AxisExtent[EncoderEmbedding]): ViTPatchingParams =
+    ViTPatchingParams(
+      projectionWeights = Normal.standardIsotropic(Shape(patchWidthExtent, patchHeightExtent, channelExtent, embeddingExtent), scale = 0.02f).sample(key)
+    )
 
 case class LinearLayer[In: Label, Out: Label](params: LinearLayerParams[In, Out]) extends (Tensor1[In, Float] => Tensor1[Out, Float]):
   override def apply(x: Tensor1[In, Float]): Tensor1[Out, Float] =
@@ -229,8 +296,60 @@ case class ViTPatching(params: ViTPatchingParams):
     val kernelSize = (weightShape.extent(Axis[Width]), weightShape.extent(Axis[Height]))
     Conv2DLayer(Conv2DLayer.Params(params.projectionWeights), stride = kernelSize)
 
-  private def positionalEncoding2D: Tensor3[Width, Height, EncoderEmbedding, Float] = ???
+  private def positionalEncoding2D(shape: Shape3[Width, Height, EncoderEmbedding]): Tensor3[Width, Height, EncoderEmbedding, Float] =
+    // 1. Prepare things we need for positional encoding
+    val widthExtent = shape.extent(Axis[Width]).size
+    val heightExtent = shape.extent(Axis[Height]).size
+    val embedDim = shape.extent(Axis[EncoderEmbedding]).size
+    val scaleCount = embedDim / 4
+    val posScales = (Tensor1(Axis[EncoderEmbedding]).fromArray(Array.range(0, scaleCount)).asFloat *! -(Tensor0(10000.0f).log / scaleCount)).exp
+
+    // 2. Prepare Width (X-axis)
+    val widthPosRaw = Tensor1(Axis[Width]).fromArray(Array.range(0, widthExtent))
+    val widthPosScaled = widthPosRaw.asFloat.vmap(Axis[Width])(_ *! posScales)
+    val widthPosEncoded = concatenate(widthPosScaled.sin, widthPosScaled.cos, concatAxis = Axis[EncoderEmbedding])
+
+    // 3. Prepare Height (Y-axis)
+    val heightPosRaw = Tensor1(Axis[Height]).fromArray(Array.range(0, heightExtent))
+    val heightPosScaled = heightPosRaw.asFloat.vmap(Axis[Height])(_ *! posScales)
+    val heightPosEncoded = concatenate(heightPosScaled.sin, heightPosScaled.cos, concatAxis = Axis[EncoderEmbedding])
+
+    // 4. Expansion into 2D Grids and Concatenation
+    val widthPosGrid = stack(List.fill(heightExtent)(widthPosEncoded), newAxis = Axis[Height]).transpose(Axis[Width], Axis[Height], Axis[EncoderEmbedding])
+    val heightPosGrid = stack(List.fill(widthExtent)(heightPosEncoded), newAxis = Axis[Width])
+
+    concatenate(widthPosGrid, heightPosGrid, concatAxis = Axis[EncoderEmbedding])
 
   def apply(img: Tensor3[Width, Height, Channel, Float]): Tensor2[Width |*| Height, EncoderEmbedding, Float] =
-    val projected = projection(img) + positionalEncoding2D
-    projected.flatten((Axis[Width], Axis[Height]))
+    val projected = projection(img)
+    val x = projection(img) + positionalEncoding2D(projected.shape)
+    x.flatten((Axis[Width], Axis[Height]))
+
+case class Timer private ():
+
+  private var lastTime = System.currentTimeMillis()
+  private var internalRunningAverage = -1f
+
+  def tick(): Unit =
+    val now = System.currentTimeMillis()
+    val elapsed = now - lastTime
+    internalRunningAverage =
+      if internalRunningAverage == -1f
+      then elapsed
+      else 0.9f * internalRunningAverage + 0.1f * elapsed
+    lastTime = now
+
+  def reset(): Unit =
+    lastTime = System.currentTimeMillis()
+    internalRunningAverage = -1f
+
+  def runningAvgSeconds: Float = internalRunningAverage / 1000f
+
+case class Embedder[Context: Label, Embedding: Label](vocabularyEmbeddings: Tensor2[Vocab, Embedding, Float], positionalEmbeddings: Tensor2[Context, Embedding, Float]):
+
+  def apply(tokens: Tensor1[Context, Int]): Tensor2[Context, Embedding, Float] =
+    val embeddings = vocabularyEmbeddings.take(Axis[Vocab])(tokens)
+    embeddings + positionalEmbeddings
+
+object Timer:
+  def start(): Timer = new Timer()

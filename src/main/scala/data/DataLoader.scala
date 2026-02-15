@@ -1,6 +1,6 @@
 package resplan.data
 
-import dimwit.{Tensor, Tensor1, Axis, Label, Random}
+import dimwit.*
 import me.shadaj.scalapy.py
 import me.shadaj.scalapy.py.SeqConverters
 import me.shadaj.scalapy.py.PyQuote
@@ -10,12 +10,17 @@ import dimwit.tensor.VType
 import scala.util.Try
 import scala.util.Failure
 import scala.util.Success
+import dimwit.tensor.Tensor3
+import dimwit.tensor.Shape
 
+trait Data derives Label
 trait Width derives Label
 trait Height derives Label
 trait Channel derives Label
 trait Node derives Label
 trait Edge derives Label
+
+val paddingValue = -1
 
 enum NodeClass(val id: Int, val prefix: String):
   case Living extends NodeClass(0, "living")
@@ -33,18 +38,32 @@ enum EdgeClass(val id: Int, val name: String):
   case Edge extends EdgeClass(10, "edge")
   case EndOfEdges extends EdgeClass(11, "<eoe>")
 
-trait PlanRenderer:
-  def render(plan: RawPlan): Tensor[(Width, Height, Channel), Int]
+val BOS = 12
 
-object StaticRenderer extends PlanRenderer:
-  def render(plan: RawPlan): Tensor[(Width, Height, Channel), Int] =
-    val img = PythonHelper.pyutil.render_plan_static(plan)
-    Tensor.fromPy(VType[Int])(img)
+val POS_OFFSET = 13
+
+def isSameGraph(pred: Graph, target: Graph): Boolean =
+  false // TODO
+
+def areNodesCorrect(predNodes: List[RawNode], targetNodes: List[RawNode]): Boolean =
+  predNodes.size == targetNodes.size && predNodes.diff(targetNodes).isEmpty
+
+case class GraphLinearizationScore(structureCorrect: Boolean, nodesCorrect: Boolean, graphCorrect: Boolean)
+
+extension (b: Boolean)
+  def toFloat: Float = if b then 1.0f else 0.0f
 
 trait GraphLinearization:
 
-  def linearize(nodes: List[RawNode], edges: List[RawEdge]): Tensor1[Vocab, Int]
-  def strictUnlinearize(lineraizedGraph: Tensor1[Vocab, Int]): Try[(List[RawNode], List[RawEdge])]
+  def linearize(graph: Graph): Tensor1[DecoderContext, Int]
+  def strictUnlinearize(lineraizedGraph: Tensor1[DecoderContext, Int]): Try[Graph]
+  def score(pred: Tensor1[DecoderContext, Int], target: Tensor1[DecoderContext, Int]): GraphLinearizationScore =
+    strictUnlinearize(pred) match
+      case Failure(exception) =>
+        GraphLinearizationScore(false, false, false)
+      case Success(value) =>
+        val targetGraph = strictUnlinearize(target).get
+        GraphLinearizationScore(true, areNodesCorrect(value.nodes, targetGraph.nodes), isSameGraph(value, targetGraph))
 
   protected def encodeNode(node: RawNode): NodeClass =
     val nodeClasses = NodeClass.values.toList
@@ -53,10 +72,10 @@ trait GraphLinearization:
   protected def encodeEdgeClass(edge: RawEdge): EdgeClass =
     EdgeClass.Edge // for now, we only have one edge class in the dataset
 
-object RandomGraphLinearization extends GraphLinearization:
-  def linearize(nodes: List[RawNode], edges: List[RawEdge]): Tensor1[Vocab, Int] =
-    val shuffledNodes = scala.util.Random.shuffle(nodes)
-    val shuffledEdges = scala.util.Random.shuffle(edges)
+case class RandomGraphLinearization(val maxLength: Int = 128) extends GraphLinearization:
+  def linearize(graph: Graph): Tensor1[DecoderContext, Int] =
+    val shuffledNodes = scala.util.Random.shuffle(graph.nodes)
+    val shuffledEdges = scala.util.Random.shuffle(graph.edges)
     val nodeArray = (shuffledNodes.map(encodeNode).map(_.id) :+ NodeClass.EndOfNodes.id).toArray
     val nodesPos = shuffledNodes.zipWithIndex.map:
       case (node, index) =>
@@ -70,13 +89,22 @@ object RandomGraphLinearization extends GraphLinearization:
     var i = 0
     while i < shuffledEdges.length do
       edgeArray(i * 3 + 0) = edgesClass(i).id
-      edgeArray(i * 3 + 1) = edgesFrom(i)
-      edgeArray(i * 3 + 2) = edgesTo(i)
+      // shift edge position by POS_OFFSET to make position tokens unique vocab items
+      edgeArray(i * 3 + 1) = edgesFrom(i) + POS_OFFSET
+      edgeArray(i * 3 + 2) = edgesTo(i) + POS_OFFSET
       i += 1
     edgeArray(shuffledEdges.length * 3) = EdgeClass.EndOfEdges.id
-    Tensor1(Axis[Vocab]).fromArray(nodeArray ++ edgeArray)
+    val paddedArray = Array.fill(maxLength)(paddingValue)
+    var j = 0
+    for node <- nodeArray do
+      paddedArray(j) = node
+      j += 1
+    for edge <- edgeArray do
+      paddedArray(j) = edge
+      j += 1
+    Tensor1(Axis[DecoderContext]).fromArray(paddedArray)
 
-  def strictUnlinearize(lineraizedGraph: Tensor1[Vocab, Int]): Try[(List[RawNode], List[RawEdge])] =
+  def strictUnlinearize(lineraizedGraph: Tensor1[DecoderContext, Int]): Try[Graph] =
     def zipWithClassIndex(list: List[NodeClass]): List[(NodeClass, Int)] =
       var classCounter = Map[NodeClass, Int]().withDefaultValue(0)
       list.map: nodeClass =>
@@ -84,9 +112,9 @@ object RandomGraphLinearization extends GraphLinearization:
         classCounter = classCounter.updated(nodeClass, idx + 1)
         (nodeClass, idx)
     try
-      val tokens = py"list(${lineraizedGraph.jaxValue})".as[List[Int]]
+      val tokens = py"list(${lineraizedGraph.jaxValue})".as[List[Int]].takeWhile(_ != EdgeClass.EndOfEdges.id)
       val (nodeTokens, rest) = tokens.splitAt(tokens.indexOf(NodeClass.EndOfNodes.id))
-      val edgeTokens = rest.tail
+      val edgeTokens = rest.tail // drop EndOfNodes token
       val nodeClasses = nodeTokens
         .map: nodeId =>
           NodeClass.values.find(_.id == nodeId) match
@@ -94,16 +122,15 @@ object RandomGraphLinearization extends GraphLinearization:
             case None        => throw new RuntimeException(f"Unknown node class id: $nodeId")
       val nodes = zipWithClassIndex(nodeClasses).map: (nodeClass, idx) =>
         RawNode(f"${nodeClass.prefix}_$idx")
-      assert(edgeTokens.last == EdgeClass.EndOfEdges.id)
-      val edges = edgeTokens.init.grouped(3).map: edge =>
+      val edges = edgeTokens.grouped(3).map: edge =>
         val edgeClass = EdgeClass.values.find(_.id == edge(0)) match
           case Some(value) => value
           case None        => throw new RuntimeException(f"Unknown edge class id: ${edge(0)}")
-        val edgeFrom = nodes(edge(1))
-        val edgeTo = nodes(edge(2))
+        val edgeFrom = nodes(edge(1) - POS_OFFSET)
+        val edgeTo = nodes(edge(2) - POS_OFFSET)
         RawEdge(edgeFrom.nodeName, edgeTo.nodeName, edgeClass.name)
       .toList
-      Success((nodes, edges))
+      Success(Graph(nodes, edges))
     catch
       case e: Throwable => Failure(e)
 
@@ -111,19 +138,21 @@ type RawPlan = Map[String, py.Dynamic]
 case class RawEdge(fromNodeName: String, toNodeName: String, edgeClassName: String)
 case class RawNode(nodeName: String)
 
-case class RawSample(plan: RawPlan, nodes: List[RawNode], edges: List[RawEdge])
-case class Sample(image: Tensor[(Width, Height, Channel), Int], lineraizedGraph: Tensor1[Vocab, Int])
+case class Graph(nodes: List[RawNode], edges: List[RawEdge])
+
+case class RawSample(imgPos: Int, graph: Graph)
+case class Sample(image: Tensor[(Width, Height, Channel), Float], lineraizedGraph: Tensor1[DecoderContext, Int])
 
 object ResPlanDataset:
   // 1. Load data via ScalaPy
-  private val pickle = py.module("pickle")
+  private val json = py.module("json")
   private val builtins = py.module("builtins")
 
-  def loadRawPlans(dataPath: String = "res/ResPlan.pkl"): List[RawSample] =
+  def loadRawPlans(dataPath: String = "res/plans/20/metadata.json"): List[RawSample] =
     val file = builtins.open(dataPath, "rb")
     val data =
       try
-        pickle.load(file)
+        json.load(file)
       catch
         case e: Throwable =>
           throw RuntimeException(s"Error loading data from $dataPath. Maybe forgot to run 'git lfs pull'? Original error: ${e.getMessage}")
@@ -131,25 +160,42 @@ object ResPlanDataset:
         file.close()
     data.as[List[Map[String, py.Dynamic]]]
       .map: plan =>
-        // fix "balacony" => "balcony" typo in the dataset
-        if plan.contains("balacony")
-        then plan.updated("balcony", plan("balacony")).removed("balacony")
-        else plan
-      .map: plan =>
-        val graph = plan("graph")
-        val nodes = py"list(${graph.nodes})".as[List[String]].map(RawNode(_))
-        val edges = py"list(${graph.edges(data = true)})".as[List[(String, String, py.Dynamic)]].map: (from, to, data) =>
-          RawEdge(from, to, data.bracketAccess("type").as[String])
-        RawSample(plan, nodes, edges)
+        val dict = plan.as[Map[String, py.Dynamic]]
+        val imgPos = dict("img_pos").as[Int]
+        val pyNodes = dict("nodes")
+        val pyEdges = dict("edges")
+        val nodes = pyNodes.as[List[String]].map(RawNode(_))
+        val edges = pyEdges.as[List[py.Dynamic]].map: e =>
+          RawEdge(
+            e.bracketAccess(0).as[String],
+            e.bracketAccess(1).as[String],
+            e.bracketAccess(2).as[String]
+          )
+        RawSample(imgPos, Graph(nodes, edges))
 
-class ResPlanDataset(
+case class ResPlanDataset(
     plans: List[RawSample],
+    images: Tensor[(Data, Width, Height, Channel), Int],
     graphLinearization: GraphLinearization,
-    renderer: PlanRenderer
+    normalizeImage: Tensor[(Width, Height, Channel), Int] => Tensor[(Width, Height, Channel), Float],
+    inifinite: Boolean = false
 ):
-  def length: Int = plans.length
-  def iterator: Iterator[Sample] =
-    plans.iterator.map(rawSample =>
-      val linearizedGraph = graphLinearization.linearize(rawSample.nodes, rawSample.edges)
-      Sample(renderer.render(rawSample.plan), linearizedGraph)
+  private def rawSample2Sample(rawSample: RawSample): Sample =
+    val linearizedGraph = graphLinearization.linearize(rawSample.graph)
+    // val image = images.slice(Axis[Data].at(rawSample.imgPos)) // <-- leads to OOM
+    val index = Tensor(Shape1(Axis[Data] -> 1)).fill(rawSample.imgPos)
+    // slice with extra steps
+    val image = images.take(Axis[Data])(index).flatten((Axis[Data], Axis[Width])).relabel(
+      Axis[Data |*| Width] -> Axis[Width]
     )
+    val sample = Sample(normalizeImage(image), linearizedGraph)
+    sample
+
+  private def planIterator =
+    if inifinite
+    then Iterator.continually(plans).flatten
+    else plans.iterator
+
+  def length: Int = plans.length
+
+  def iterator: Iterator[Sample] = planIterator.map(rawSample2Sample)

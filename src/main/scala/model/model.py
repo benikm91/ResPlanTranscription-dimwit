@@ -15,6 +15,7 @@ class ViTPatching(nn.Module):
     def positional_encoding_2d(self, d_model, height, width):
         """
         Create the 2D positional encoding for the input image.
+        :return shape (1, d_model, height, width) 
         """
         if d_model % 4 != 0:
             raise ValueError("Cannot use sin/cos positional encoding with odd dimension (got dim={:d})".format(d_model))
