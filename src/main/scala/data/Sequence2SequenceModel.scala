@@ -114,11 +114,16 @@ object Sequence2SequenceModelParams:
       outputProjection = ProjectionLayerParams.init(outputProjectionKey, decoderEmbeddingExtent, vocabExtent)
     )
 
-case class Sequence2SequenceModel(params: Sequence2SequenceModelParams):
+case class Sequence2SequenceModelHyperParams(
+    encoderTransformerLayer: TransformerLayerHyperParams[EncoderContext, EncoderEmbedding],
+    decoderCrossTransformerLayer: CrossTransformerLayerHyperParams[EncoderContext, EncoderEmbedding, DecoderContext, DecoderEmbedding]
+)
+
+case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyperParams)(params: Sequence2SequenceModelParams):
 
   private val vitPatching = ViTPatching(params.vitPatchingParams)
-  private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer.fromParams(_, noMasking[EncoderContext])))
-  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer.fromParams(Axis[EncoderContext], _, causalMasking[DecoderContext])))
+  private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer.fromParams(hyperParams.encoderTransformerLayer)))
+  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer.fromParams(hyperParams.decoderCrossTransformerLayer)))
   private val embedder = Embedder(params.vocabEmbedding, params.positionalEmbeddings)
   private val outputLayer = LayerNorm(params.outputLayerNormalization) andThen ProjectionLayer(params.outputProjection)
 
@@ -142,27 +147,66 @@ case class Sequence2SequenceModel(params: Sequence2SequenceModelParams):
     val finalEncoderContext = encoder(encoderInputContext)
 
     // Initialize the sequence with BOS (Beginning of Sequence) and Padding
-    val currentRes = Tensor(Shape1(decoderContextExtent)).fill(paddingValue)
-    currentRes.set(Axis[DecoderContext].at(0))(Tensor0(BOS))
+    var finalOutputSeq = Tensor(Shape1(decoderContextExtent)).fill(paddingValue)
 
     // Autoregressive loop
 
-    for i <- 0 until (decoderContextExtent.size - 1) do
-      val inputContext = embedder(currentRes)
+    for i <- 0 until decoderContextExtent.size do
+      val currentInputSeq = shiftRight(finalOutputSeq).set(Axis[DecoderContext].at(0))(BOS)
+      val inputContext = embedder(currentInputSeq)
       val finalContext = decoder(finalEncoderContext, inputContext)
 
       // Get logits for the CURRENT position only
       val logitsAtPos = outputLayer(finalContext.slice(Axis[DecoderContext].at(i)))
       val nextToken = logitsAtPos.argmax(Axis[Vocab])
 
-      currentRes.set(Axis[DecoderContext].at(i + 1))(nextToken)
+      finalOutputSeq = finalOutputSeq.set(Axis[DecoderContext].at(i))(nextToken)
 
       // if nextToken == EdgeClass.EndOfEdges.id then
       //  break
 
-    currentRes
+    finalOutputSeq
+
+object Sequence2SequenceModelHyperParams:
+  def apply(key: Random.Key, isTraining: Boolean): Sequence2SequenceModelHyperParams =
+    val keys = key.split(7).iterator
+    new Sequence2SequenceModelHyperParams(
+      encoderTransformerLayer = TransformerLayerHyperParams(
+        embeddingMixer = EmbeddingMixerHyperParams(
+          hiddenDropout = DropoutHyperParams(0.1f, keys.next(), isTraining),
+          outputDropout = DropoutHyperParams(0.1f, keys.next(), isTraining)
+        ),
+        attn = MultiHeadAttentionHyperParams(
+          attentionMasking = noMasking,
+          attentionDropout = DropoutHyperParams(0.1f, keys.next(), isTraining)
+        )
+      ),
+      decoderCrossTransformerLayer = CrossTransformerLayerHyperParams(
+        crossAttention = MultiHeadCrossAttentionHyperParams(
+          DropoutHyperParams(0.1f, keys.next(), isTraining)
+        ),
+        transformer = TransformerLayerHyperParams(
+          embeddingMixer = EmbeddingMixerHyperParams(
+            hiddenDropout = DropoutHyperParams(0.1f, keys.next(), isTraining),
+            outputDropout = DropoutHyperParams(0.1f, keys.next(), isTraining)
+          ),
+          attn = MultiHeadAttentionHyperParams(
+            attentionMasking = causalMasking,
+            attentionDropout = DropoutHyperParams(0.1f, keys.next(), isTraining)
+          )
+        )
+      )
+    )
+
+val Sequence2SequenceTrainModel = Sequence2SequenceModelFamily(Sequence2SequenceModelHyperParams(Random.Key(42), true))
+val Sequence2SequenceEvalModel = Sequence2SequenceModelFamily(Sequence2SequenceModelHyperParams(Random.Key(42), false))
 
 case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], target: Tensor2[Batch, DecoderContext, Int])
+
+def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
+  val array = Jax.jnp.roll(target.jaxValue, shift = 1, axis = -1) // TODO add to dimwit
+  array.at.bracketAccess(0).set(BOS)
+  Tensor1.fromPy(Axis[DecoderContext], target.vtype)(array)
 
 @main def train(): Unit =
   scalaRandom.setSeed(42)
@@ -218,7 +262,7 @@ case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], ta
     where(paddingMask, lossPerContextPosition, zeros).sum / paddingMask.asFloat.sum
 
   def batchLoss(imgs: Tensor[(Batch, Width, Height, Channel), Float], shiftedTargets: Tensor2[Batch, DecoderContext, Int], targets: Tensor2[Batch, DecoderContext, Int])(params: Sequence2SequenceModelParams): Tensor0[Float] =
-    val model = Sequence2SequenceModel(params)
+    val model = Sequence2SequenceTrainModel(params)
     val logits = zipvmap(Axis[Batch])(imgs, shiftedTargets)(model.logits)
     val batchLosses = zipvmap(Axis[Batch])(logits, targets)(loss)
     batchLosses.mean
@@ -237,11 +281,11 @@ case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], ta
   val jitStep = jitDonatingUnsafe(gradientStep)
 
   def calcLogits(params: Sequence2SequenceModelParams, image: Tensor[(Width, Height, Channel), Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
-    Sequence2SequenceModel(params).logits(image, shiftedTargets)
+    Sequence2SequenceEvalModel(params).logits(image, shiftedTargets)
   val jitLogits = eagerCleanup(calcLogits)
 
   def generate(params: Sequence2SequenceModelParams, img: Tensor3[Width, Height, Channel, Float]): Tensor1[DecoderContext, Int] =
-    val model = Sequence2SequenceModel(params)
+    val model = Sequence2SequenceEvalModel(params)
     model.generate(img)
 
   val jitGenerate = jit(generate)
@@ -256,16 +300,13 @@ case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], ta
     val valLoss = loss(logits, targets)
 
     val valPrediction = jitGenerate(params, sample.image)
+    val score = graphLinearization.score(valPrediction, targets)
+
     println(f"Targets: $targets")
     println(f"Predict: $valPrediction")
+    println(f"Score: $score")
 
-    val score = graphLinearization.score(valPrediction, targets)
     (valLoss, score)
-
-  def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
-    val array = Jax.jnp.roll(target.jaxValue, shift = 1, axis = -1) // TODO add to dimwit
-    array.at.bracketAccess(0).set(BOS)
-    Tensor1.fromPy(Axis[DecoderContext], target.vtype)(array)
 
   def miniBatchGradientDescent(
       samples: Iterator[BatchSample],

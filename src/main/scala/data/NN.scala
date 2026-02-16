@@ -8,6 +8,7 @@ import me.shadaj.scalapy.py
 import me.shadaj.scalapy.py.SeqConverters
 import nn.Conv2DLayer
 import dimwit.stats.Normal
+import dimwit.stats.Bernoulli
 
 object Util:
   def vmap[T <: Tuple: Labels, T2 <: Tuple: Labels, L: Label, V](axis: Axis[L])(f: (Tensor[T, V] => Tensor[T2, V])): Tensor[L *: T, V] => Tensor[L *: T2, V] =
@@ -28,6 +29,20 @@ object Util:
 import Util.vmap
 import resplan.data as Context
 import resplan.data as Embedding
+
+case class DropoutLayer[L: Label](hyperParams: DropoutHyperParams[L]) extends (Tensor1[L, Float] => Tensor1[L, Float]):
+
+  private def dropout(keepProb: Tensor0[Prob])(x: Tensor1[L, Float], key: Random.Key): Tensor1[L, Float] =
+    val mask = IndependentDistribution.fromUnivariate(x.shape, Bernoulli(keepProb)).sample(key)
+    x * mask.asFloat
+
+  override def apply(x: Tensor1[L, Float]): Tensor1[L, Float] =
+    import hyperParams.*
+    if isTraining then
+      // Scale output by 1/keepProb to maintain the expected value of the activations at inference time
+      val keepProb = Prob(Tensor0(1f - dropoutRate))
+      dropout(keepProb)(x, key) /! keepProb.asFloat
+    else x
 
 case class LayerNormalizationParams[L](
     weight: Tensor1[L, Float],
@@ -149,14 +164,15 @@ case class LinearLayer[In: Label, Out: Label](params: LinearLayerParams[In, Out]
   override def apply(x: Tensor1[In, Float]): Tensor1[Out, Float] =
     x.dot(Axis[In])(params.weight) + params.bias
 
-case class EmbeddingMixer[Embedding: Label](params: EmbeddingMixerParams[Embedding]) extends (Tensor1[Embedding, Float] => Tensor1[Embedding, Float]):
+case class EmbeddingMixer[Embedding: Label](hyperParams: EmbeddingMixerHyperParams[Embedding])(params: EmbeddingMixerParams[Embedding]) extends (Tensor1[Embedding, Float] => Tensor1[Embedding, Float]):
   private val hiddenLayer = LinearLayer(params.c_fc)
   private val outputLayer = LinearLayer(params.c_proj)
-  // TODO add dropout
+  private val hiddenDropout = DropoutLayer(hyperParams.hiddenDropout)
+  private val outputDropout = DropoutLayer(hyperParams.outputDropout)
 
-  def apply(in: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
-    val hidden = gelu(hiddenLayer(in))
-    outputLayer(hidden)
+  override def apply(in: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
+    val hidden = hiddenDropout(gelu(hiddenLayer(in)))
+    outputDropout(outputLayer(hidden))
 
 case class ProjectionLayer[In: Label, Out: Label](params: ProjectionLayerParams[In, Out]) extends (Tensor1[In, Float] => Tensor1[Out, Float]):
   def apply(x: Tensor1[In, Float]): Tensor1[Out, Float] = x.dot(Axis[In])(params.weight)
@@ -168,24 +184,33 @@ def causalMasking[Context: Label](attnScores: Tensor2[Context, Prime[Context], F
 
 def noMasking[Context](attnScores: Tensor2[Context, Prime[Context], Float]): Tensor2[Context, Prime[Context], Float] = attnScores
 
+object MultiHeadAttention:
+  trait AttnWeights derives Label
+
 case class MultiHeadAttention[Context: Label, Embedding: Label](
-    params: MultiHeadAttentionParams[Embedding],
-    attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float]
+    hyperParams: MultiHeadAttentionHyperParams[Context]
+)(
+    params: MultiHeadAttentionParams[Embedding]
 ) extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
 
+  import MultiHeadAttention.AttnWeights
+
   private val projection = LinearLayer(params.proj)
+  private val attentionWeightDropout = DropoutLayer(hyperParams.attentionDropout)
 
   def apply(x: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+    import hyperParams.*
     val heads = zipvmap(Axis[Head])(params.wq.weights, params.wk.weights, params.wv.weights):
-      attention.tupled(_)(x)
+      case (wq, wk, wv) =>
+        attention(wq, wk, wv, attentionMasking)(x)
     heads.vmap(Axis[Context])(heads => projection(heads.flatten))
 
   private def attention(
       wq: Tensor2[Embedding, HeadQuery, Float],
       wk: Tensor2[Embedding, HeadKey, Float],
-      wv: Tensor2[Embedding, HeadValue, Float]
+      wv: Tensor2[Embedding, HeadValue, Float],
+      attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float]
   )(x: Tensor2[Context, Embedding, Float]): Tensor2[Context, HeadValue, Float] =
-    trait AttnWeights derives Label
     val queries = x.dot(Axis[Embedding])(wq)
     val keys = x.dot(Axis[Embedding])(wk)
     val values = x.dot(Axis[Embedding])(wv)
@@ -193,14 +218,28 @@ case class MultiHeadAttention[Context: Label, Embedding: Label](
     val attnScores = (queries.dot(Axis[HeadQuery ~ HeadKey])(keys) /! dk)
     val attnWeights = attentionMasking(attnScores)
       .vmap(Axis[Context])(attnScore => softmax(attnScore).relabelTo(Axis[AttnWeights]))
-    val res = attnWeights.dot(Axis[AttnWeights ~ Context])(values)
+    val droppedWeights = attnWeights.vmap(Axis[Context]): w =>
+      attentionWeightDropout.apply(w)
+    val res = droppedWeights.dot(Axis[AttnWeights ~ Context])(values)
     res
 
+case class MultiHeadCrossAttentionHyperParams(
+    crossAttentionWeightsDropout: DropoutHyperParams[MultiHeadCrossAttention.CrossAttnWeights]
+)
+
+object MultiHeadCrossAttention:
+  trait CrossAttnWeights derives Label
+
 case class MultiHeadCrossAttention[CrossEmbedding: Label, Embedding: Label](
+    hyperParams: MultiHeadCrossAttentionHyperParams
+)(
     params: MultiHeadCrossAttentionParams[CrossEmbedding, Embedding]
 ):
 
+  import MultiHeadCrossAttention.CrossAttnWeights
+
   private val projection = LinearLayer(params.proj)
+  private val crossAttentionWeightsDropout = DropoutLayer(hyperParams.crossAttentionWeightsDropout)
 
   def apply[CrossContext: Label, Context: Label](crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
     val heads = zipvmap(Axis[Head])(params.wq.weights, params.wk.weights, params.wv.weights):
@@ -213,15 +252,15 @@ case class MultiHeadCrossAttention[CrossEmbedding: Label, Embedding: Label](
       wk: Tensor2[CrossEmbedding, HeadKey, Float],
       wv: Tensor2[CrossEmbedding, HeadValue, Float]
   )(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, HeadValue, Float] =
-    trait AttnWeights derives Label
     val queries = context.dot(Axis[Embedding])(wq)
     val keys = crossContext.dot(Axis[CrossEmbedding])(wk)
     val values = crossContext.dot(Axis[CrossEmbedding])(wv)
     val dk = Tensor0(Math.sqrt(keys.shape(Axis[HeadKey])).toFloat)
-    val attnScores = (queries.dot(Axis[HeadQuery ~ HeadKey])(keys) /! dk)
-    val attnWeights = attnScores
-      .vmap(Axis[Context])(attnScore => softmax(attnScore).relabelTo(Axis[AttnWeights]))
-    val res = attnWeights.dot(Axis[AttnWeights ~ CrossContext])(values)
+    val crossAttnScores = (queries.dot(Axis[HeadQuery ~ HeadKey])(keys) /! dk)
+    val crossAttnWeights = crossAttnScores
+      .vmap(Axis[Context])(attnScore => softmax(attnScore).relabelTo(Axis[CrossAttnWeights]))
+    val droppedCrossAttnWeights = crossAttnWeights.vmap(Axis[Context])(crossAttentionWeightsDropout)
+    val res = droppedCrossAttnWeights.dot(Axis[CrossAttnWeights ~ CrossContext])(values)
     res
 
 case class LayerNorm[L: Label](params: LayerNormalizationParams[L]) extends (Tensor1[L, Float] => Tensor1[L, Float]):
@@ -246,13 +285,40 @@ case class TransformerLayer[Context: Label, Embedding: Label](
     x = x + x.vmap(Axis[Context])(embeddingMixer)
     x
 
+case class DropoutHyperParams[L](
+    dropoutRate: Float,
+    key: Random.Key,
+    isTraining: Boolean
+):
+  require(0f <= dropoutRate && dropoutRate <= 1f)
+
+case class EmbeddingMixerHyperParams[Embedding](
+    hiddenDropout: DropoutHyperParams[EmbeddingMixed],
+    outputDropout: DropoutHyperParams[Embedding]
+)
+
+case class MultiHeadAttentionHyperParams[Context](
+    attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float],
+    attentionDropout: DropoutHyperParams[MultiHeadAttention.AttnWeights]
+)
+
+case class TransformerLayerHyperParams[Context, Embedding](
+    embeddingMixer: EmbeddingMixerHyperParams[Embedding],
+    attn: MultiHeadAttentionHyperParams[Context]
+)
+
 object TransformerLayer:
-  def fromParams[Context: Label, Embedding: Label](params: TransformerLayerParams[Embedding], attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float]): TransformerLayer[Context, Embedding] =
+  def fromParams[Context: Label, Embedding: Label](
+      hyperParams: TransformerLayerHyperParams[Context, Embedding]
+  )(
+      params: TransformerLayerParams[Embedding]
+  ): TransformerLayer[Context, Embedding] =
     val preNormalization = LayerNorm(params.ln1)
     val postNormalization = vmap(Axis[Context])(LayerNorm(params.ln2))
+
     TransformerLayer(
-      embeddingMixer = preNormalization andThen EmbeddingMixer(params.embeddingMixer),
-      contextMixer = postNormalization andThen MultiHeadAttention(params.attn, attentionMasking)
+      embeddingMixer = preNormalization andThen EmbeddingMixer(hyperParams.embeddingMixer)(params.embeddingMixer),
+      contextMixer = postNormalization andThen MultiHeadAttention(hyperParams.attn)(params.attn)
     )
 
 case class CrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label](
@@ -263,18 +329,23 @@ case class CrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Con
   override def apply(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
     transformerLayer(context + crossContextMixer(crossContext, context))
 
+case class CrossTransformerLayerHyperParams[CrossContext, CrossEmbedding, Context, Embedding](
+    crossAttention: MultiHeadCrossAttentionHyperParams,
+    transformer: TransformerLayerHyperParams[Context, Embedding]
+)
+
 object CrossTransformerLayer:
   def fromParams[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label](
-      forAxis: Axis[CrossContext],
-      params: CrossTransformerLayerParams[CrossEmbedding, Embedding],
-      attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float]
+      hyperParams: CrossTransformerLayerHyperParams[CrossContext, CrossEmbedding, Context, Embedding]
+  )(
+      params: CrossTransformerLayerParams[CrossEmbedding, Embedding]
   ): CrossTransformerLayer[CrossContext, CrossEmbedding, Context, Embedding] =
     val crossAttentionPreNormalization = vmap(Axis[Context])(LayerNorm(params.crossAttentionPreNormalization))
-    val multiHeadCrossAttention = MultiHeadCrossAttention(params.crossAttention)
+    val multiHeadCrossAttention = MultiHeadCrossAttention(hyperParams.crossAttention)(params.crossAttention)
     CrossTransformerLayer(
       crossContextMixer = (crossContext, context) =>
         multiHeadCrossAttention(crossContext, crossAttentionPreNormalization(context)),
-      TransformerLayer.fromParams(params.transformer, attentionMasking)
+      TransformerLayer.fromParams(hyperParams.transformer)(params.transformer)
     )
 
 case class TransformerBlock[Context: Label, Embedding](layers: List[TransformerLayer[Context, Embedding]]) extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
