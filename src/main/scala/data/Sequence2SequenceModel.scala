@@ -136,6 +136,32 @@ case class Sequence2SequenceModel(params: Sequence2SequenceModelParams):
   def apply(img: Tensor3[Width, Height, Channel, Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
     logits(img, shiftedTargets).argmax(Axis[Vocab])
 
+  def generate(img: Tensor3[Width, Height, Channel, Float]): Tensor1[DecoderContext, Int] =
+    val flatPatches = vitPatching(img)
+    val encoderInputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
+    val finalEncoderContext = encoder(encoderInputContext)
+
+    // Initialize the sequence with BOS (Beginning of Sequence) and Padding
+    val currentRes = Tensor(Shape1(decoderContextExtent)).fill(paddingValue)
+    currentRes.set(Axis[DecoderContext].at(0))(Tensor0(BOS))
+
+    // Autoregressive loop
+
+    for i <- 0 until (decoderContextExtent.size - 1) do
+      val inputContext = embedder(currentRes)
+      val finalContext = decoder(finalEncoderContext, inputContext)
+
+      // Get logits for the CURRENT position only
+      val logitsAtPos = outputLayer(finalContext.slice(Axis[DecoderContext].at(i)))
+      val nextToken = logitsAtPos.argmax(Axis[Vocab])
+
+      currentRes.set(Axis[DecoderContext].at(i + 1))(nextToken)
+
+      // if nextToken == EdgeClass.EndOfEdges.id then
+      //  break
+
+    currentRes
+
 case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], target: Tensor2[Batch, DecoderContext, Int])
 
 @main def train(): Unit =
@@ -212,7 +238,13 @@ case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], ta
 
   def calcLogits(params: Sequence2SequenceModelParams, image: Tensor[(Width, Height, Channel), Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
     Sequence2SequenceModel(params).logits(image, shiftedTargets)
-  val jitLogits = eager(calcLogits)
+  val jitLogits = eagerCleanup(calcLogits)
+
+  def generate(params: Sequence2SequenceModelParams, img: Tensor3[Width, Height, Channel, Float]): Tensor1[DecoderContext, Int] =
+    val model = Sequence2SequenceModel(params)
+    model.generate(img)
+
+  val jitGenerate = jit(generate)
 
   def evaluate(
       sample: Sample,
@@ -220,12 +252,13 @@ case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], ta
       graphLinearization: GraphLinearization
   ): (Tensor0[Float], GraphLinearizationScore) =
     val targets = sample.lineraizedGraph
-    // TODO implement autoregressive prediction for "real" evaluation
     val logits = jitLogits(params, sample.image, shiftRight(targets))
     val valLoss = loss(logits, targets)
-    val valPrediction = logits.argmax(Axis[Vocab])
+
+    val valPrediction = jitGenerate(params, sample.image)
     println(f"Targets: $targets")
     println(f"Predict: $valPrediction")
+
     val score = graphLinearization.score(valPrediction, targets)
     (valLoss, score)
 
