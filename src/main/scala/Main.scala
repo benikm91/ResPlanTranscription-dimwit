@@ -12,6 +12,9 @@ import resplan.data.Graph
 import me.shadaj.scalapy.py.SeqConverters
 import resplan.data.{Data, Width, Height, Channel}
 import dimwit.jax.Jax
+import resplan.data.ImageAugmentation
+import resplan.data.RandomUtil.toSourceOfRandomness
+import scala.concurrent.ExecutionContext.Implicits.global
 
 @main def dataExample(): Unit =
   val plans = ResPlanDataset.loadRawPlans()
@@ -23,8 +26,8 @@ import dimwit.jax.Jax
     planImages,
     RandomGraphLinearization(),
     image =>
-      println(image.shape)
-      image.asFloat /! 255f
+      image.asFloat /! 255f,
+    Random.Key(42).toSourceOfRandomness
   )
   println(dataset.length)
 
@@ -47,7 +50,19 @@ import dimwit.jax.Jax
   writeQuickDot(quickDot(graph), "unlineraized.dot")
 
   val plt = PythonHelper.pyplot
+
+  val numRows = 10
+  val numCols = 10
+  val totalAugs = numRows * numCols
+
+  plt.figure(figsize = (15, 15))
+  plt.subplot(numRows, numCols, 1)
   plt.imshow(sample.image.jaxValue)
+  for (i, augKey) <- (2 to totalAugs).zip(Random.Key(42).toSourceOfRandomness) do
+    val augImage = ImageAugmentation(sample.image, augKey)
+    plt.subplot(numRows, numCols, i)
+    plt.imshow(augImage.jaxValue)
+  plt.tight_layout()
   plt.show()
 
 def writeQuickDot(dot: String, filename: String): Unit =

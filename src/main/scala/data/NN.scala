@@ -41,7 +41,7 @@ case class DropoutLayer[L: Label](hyperParams: DropoutHyperParams[L]) extends (T
     if isTraining then
       // Scale output by 1/keepProb to maintain the expected value of the activations at inference time
       val keepProb = Prob(Tensor0(1f - dropoutRate))
-      dropout(keepProb)(x, key) /! keepProb.asFloat
+      dropout(keepProb)(x, sourceOfRandomness.next()) /! keepProb.asFloat
     else x
 
 case class LayerNormalizationParams[L](
@@ -287,7 +287,7 @@ case class TransformerLayer[Context: Label, Embedding: Label](
 
 case class DropoutHyperParams[L](
     dropoutRate: Float,
-    key: Random.Key,
+    sourceOfRandomness: Iterator[Random.Key],
     isTraining: Boolean
 ):
   require(0f <= dropoutRate && dropoutRate <= 1f)

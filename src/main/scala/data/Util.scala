@@ -4,6 +4,7 @@ import scala.concurrent.Future
 import scala.collection.mutable
 import scala.concurrent.Await
 import scala.concurrent.duration.*
+import dimwit.random.Random
 
 object IteratorUtil:
   extension [T](it: Iterator[Future[T]])
@@ -23,3 +24,8 @@ object IteratorUtil:
           val result = Await.result(buffer.dequeue(), atMost)
           refill()
           result
+
+object RandomUtil:
+  extension (key: Random.Key)
+    def toSourceOfRandomness: Iterator[Random.Key] =
+      Iterator.iterate(key.split2())((_, restKey) => restKey.split2()).map((key, _) => key)

@@ -12,6 +12,9 @@ import scala.util.Failure
 import scala.util.Success
 import dimwit.tensor.Tensor3
 import dimwit.tensor.Shape
+import RandomUtil.toSourceOfRandomness
+import scala.concurrent.Future
+import scala.concurrent.ExecutionContext
 
 trait Data derives Label
 trait Width derives Label
@@ -34,6 +37,11 @@ enum NodeClass(val id: Int, val prefix: String):
   case Balcony extends NodeClass(8, "balcony")
   case EndOfNodes extends NodeClass(9, "<eon>")
 
+object NodeClass:
+  def fromName(nodeName: String): NodeClass =
+    val nodeClasses = NodeClass.values.toList
+    nodeClasses.find(nodeClass => nodeName.startsWith(nodeClass.prefix)).head
+
 enum EdgeClass(val id: Int, val name: String):
   case Edge extends EdgeClass(10, "edge")
   case EndOfEdges extends EdgeClass(11, "<eoe>")
@@ -42,8 +50,35 @@ val BOS = 12
 
 val POS_OFFSET = 13
 
-def isSameGraph(pred: Graph, target: Graph): Boolean =
-  false // TODO
+def isIsomorphicTo(pred: Graph, target: Graph): Boolean =
+  if pred.nodes.size != target.nodes.size || pred.edges.size != target.edges.size
+  then false
+  else
+    val predNodes = pred.nodes.toArray
+    val targetNodes = target.nodes.toArray
+    val pAdj = pred.edges.groupBy(_.fromNodeName)
+    val tAdj = target.edges.groupBy(_.fromNodeName)
+
+    def isValid(pName: String, tName: String, mapping: Map[String, String]): Boolean =
+      val pOut = pAdj.getOrElse(pName, Nil)
+      val tOut = tAdj.getOrElse(tName, Nil)
+
+      pOut.size == tOut.size && pOut.forall: pe =>
+        mapping.get(pe.toNodeName).forall: mDest =>
+          tOut.exists(te => te.edgeClassName == pe.edgeClassName && te.toNodeName == mDest)
+
+    def solve(idx: Int, used: Set[Int], mapping: Map[String, String]): Boolean =
+      if idx == predNodes.length
+      then return true
+      else
+        val pNode = predNodes(idx)
+        targetNodes.indices.filterNot(used).exists: tIdx =>
+          val tNode = targetNodes(tIdx)
+          pNode.nodeClass == tNode.nodeClass &&
+          isValid(pNode.nodeName, tNode.nodeName, mapping + (pNode.nodeName -> tNode.nodeName)) &&
+          solve(idx + 1, used + tIdx, mapping + (pNode.nodeName -> tNode.nodeName))
+
+    solve(0, Set.empty, Map.empty)
 
 def areNodesCorrect(predNodes: List[RawNode], targetNodes: List[RawNode]): Boolean =
   predNodes.size == targetNodes.size && predNodes.diff(targetNodes).isEmpty
@@ -63,11 +98,10 @@ trait GraphLinearization:
         GraphLinearizationScore(false, false, false)
       case Success(value) =>
         val targetGraph = strictUnlinearize(target).get
-        GraphLinearizationScore(true, areNodesCorrect(value.nodes, targetGraph.nodes), isSameGraph(value, targetGraph))
+        GraphLinearizationScore(true, areNodesCorrect(value.nodes, targetGraph.nodes), isIsomorphicTo(value, targetGraph))
 
   protected def encodeNode(node: RawNode): NodeClass =
-    val nodeClasses = NodeClass.values.toList
-    nodeClasses.find(nodeClass => node.nodeName.startsWith(nodeClass.prefix)).head
+    NodeClass.fromName(node.nodeName)
 
   protected def encodeEdgeClass(edge: RawEdge): EdgeClass =
     EdgeClass.Edge // for now, we only have one edge class in the dataset
@@ -121,7 +155,7 @@ case class RandomGraphLinearization(val maxLength: Int = 128) extends GraphLinea
             case Some(value) => value
             case None        => throw new RuntimeException(f"Unknown node class id: $nodeId")
       val nodes = zipWithClassIndex(nodeClasses).map: (nodeClass, idx) =>
-        RawNode(f"${nodeClass.prefix}_$idx")
+        RawNode(f"${nodeClass.prefix}_$idx", nodeClass)
       val edges = edgeTokens.grouped(3).map: edge =>
         val edgeClass = EdgeClass.values.find(_.id == edge(0)) match
           case Some(value) => value
@@ -136,12 +170,13 @@ case class RandomGraphLinearization(val maxLength: Int = 128) extends GraphLinea
 
 type RawPlan = Map[String, py.Dynamic]
 case class RawEdge(fromNodeName: String, toNodeName: String, edgeClassName: String)
-case class RawNode(nodeName: String)
+case class RawNode(nodeName: String, nodeClass: NodeClass)
 
 case class Graph(nodes: List[RawNode], edges: List[RawEdge])
 
 case class RawSample(imgPos: Int, graph: Graph)
-case class Sample(image: Tensor[(Width, Height, Channel), Float], lineraizedGraph: Tensor1[DecoderContext, Int])
+case class Sample(image: Tensor[(Width, Height, Channel), Float], lineraizedGraph: Tensor1[DecoderContext, Int]):
+  def toGPU = Sample(image.toDevice(Device.GPU), lineraizedGraph.toDevice(Device.GPU))
 
 object ResPlanDataset:
   // 1. Load data via ScalaPy
@@ -164,7 +199,7 @@ object ResPlanDataset:
         val imgPos = dict("img_pos").as[Int]
         val pyNodes = dict("nodes")
         val pyEdges = dict("edges")
-        val nodes = pyNodes.as[List[String]].map(RawNode(_))
+        val nodes = pyNodes.as[List[String]].map(name => RawNode(name, NodeClass.fromName(name)))
         val edges = pyEdges.as[List[py.Dynamic]].map: e =>
           RawEdge(
             e.bracketAccess(0).as[String],
@@ -178,18 +213,18 @@ case class ResPlanDataset(
     images: Tensor[(Data, Width, Height, Channel), Int],
     graphLinearization: GraphLinearization,
     normalizeImage: Tensor[(Width, Height, Channel), Int] => Tensor[(Width, Height, Channel), Float],
+    sourceOfRandomness: Iterator[Random.Key],
     inifinite: Boolean = false
 ):
-  private def rawSample2Sample(rawSample: RawSample): Sample =
-    val linearizedGraph = graphLinearization.linearize(rawSample.graph)
+  private def rawSample2Sample(rawSample: RawSample, key: Random.Key): Sample =
+    val linearizedGraph = graphLinearization.linearize(rawSample.graph).toDevice(Device.CPU)
     // val image = images.slice(Axis[Data].at(rawSample.imgPos)) // <-- leads to OOM
     val index = Tensor(Shape1(Axis[Data] -> 1)).fill(rawSample.imgPos)
     // slice with extra steps
     val image = images.take(Axis[Data])(index).flatten((Axis[Data], Axis[Width])).relabel(
       Axis[Data |*| Width] -> Axis[Width]
     )
-    val sample = Sample(normalizeImage(image), linearizedGraph)
-    sample
+    Sample(normalizeImage(image), linearizedGraph)
 
   private def planIterator =
     if inifinite
@@ -198,4 +233,5 @@ case class ResPlanDataset(
 
   def length: Int = plans.length
 
-  def iterator: Iterator[Sample] = planIterator.map(rawSample2Sample)
+  def iterator: Iterator[Sample] =
+    planIterator.zip(sourceOfRandomness).map(rawSample2Sample)
