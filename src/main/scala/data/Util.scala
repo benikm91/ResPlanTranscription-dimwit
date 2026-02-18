@@ -25,6 +25,14 @@ object IteratorUtil:
           refill()
           result
 
+  extension [T](it: Iterator[T])
+    def tapEvery(n: Int)(f: (T, Int) => Unit): Iterator[T] =
+      it
+        .zipWithIndex
+        .tapEach: (t, id) =>
+          if id % n == 0 then f(t, id)
+        .map(_._1)
+
 object RandomUtil:
   extension (key: Random.Key)
     def toSourceOfRandomness: Iterator[Random.Key] =

@@ -177,12 +177,12 @@ case class EmbeddingMixer[Embedding: Label](hyperParams: EmbeddingMixerHyperPara
 case class ProjectionLayer[In: Label, Out: Label](params: ProjectionLayerParams[In, Out]) extends (Tensor1[In, Float] => Tensor1[Out, Float]):
   def apply(x: Tensor1[In, Float]): Tensor1[Out, Float] = x.dot(Axis[In])(params.weight)
 
-def causalMasking[Context: Label](attnScores: Tensor2[Context, Prime[Context], Float]): Tensor2[Context, Prime[Context], Float] =
-  val ctxLength = attnScores.shape(Axis[Context])
-  val causalMask = tril(Tensor(Shape((Axis[Context] -> ctxLength, Axis[Prime[Context]] -> ctxLength))).fill(true))
-  where(causalMask, attnScores, Tensor.like(attnScores).fill(Float.NegativeInfinity))
+def causalMask[Context: Label](axisExtent: AxisExtent[Context]): Tensor[(Context, Prime[Context]), Boolean] =
+  tril(noMask(axisExtent))
 
-def noMasking[Context](attnScores: Tensor2[Context, Prime[Context], Float]): Tensor2[Context, Prime[Context], Float] = attnScores
+def noMask[Context: Label](axisExtent: AxisExtent[Context]): Tensor[(Context, Prime[Context]), Boolean] =
+  val ctxLength = axisExtent.size
+  Tensor(Shape((Axis[Context] -> ctxLength, Axis[Prime[Context]] -> ctxLength))).fill(true)
 
 object MultiHeadAttention:
   trait AttnWeights derives Label
@@ -202,21 +202,21 @@ case class MultiHeadAttention[Context: Label, Embedding: Label](
     import hyperParams.*
     val heads = zipvmap(Axis[Head])(params.wq.weights, params.wk.weights, params.wv.weights):
       case (wq, wk, wv) =>
-        attention(wq, wk, wv, attentionMasking)(x)
+        attention(wq, wk, wv, createAttentionMasking)(x)
     heads.vmap(Axis[Context])(heads => projection(heads.flatten))
 
   private def attention(
       wq: Tensor2[Embedding, HeadQuery, Float],
       wk: Tensor2[Embedding, HeadKey, Float],
       wv: Tensor2[Embedding, HeadValue, Float],
-      attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float]
+      createAttentionMasking: AxisExtent[Context] => Tensor[(Context, Prime[Context]), Boolean]
   )(x: Tensor2[Context, Embedding, Float]): Tensor2[Context, HeadValue, Float] =
     val queries = x.dot(Axis[Embedding])(wq)
     val keys = x.dot(Axis[Embedding])(wk)
     val values = x.dot(Axis[Embedding])(wv)
     val dk = Tensor0(Math.sqrt(keys.shape(Axis[HeadKey])).toFloat)
     val attnScores = (queries.dot(Axis[HeadQuery ~ HeadKey])(keys) /! dk)
-    val attnWeights = attentionMasking(attnScores)
+    val attnWeights = where(createAttentionMasking(x.shape.extent(Axis[Context])), attnScores, Tensor.like(attnScores).fill(Float.NegativeInfinity))
       .vmap(Axis[Context])(attnScore => softmax(attnScore).relabelTo(Axis[AttnWeights]))
     val droppedWeights = attnWeights.vmap(Axis[Context]): w =>
       attentionWeightDropout.apply(w)
@@ -298,7 +298,7 @@ case class EmbeddingMixerHyperParams[Embedding](
 )
 
 case class MultiHeadAttentionHyperParams[Context](
-    attentionMasking: Tensor[(Context, Prime[Context]), Float] => Tensor[(Context, Prime[Context]), Float],
+    createAttentionMasking: AxisExtent[Context] => Tensor[(Context, Prime[Context]), Boolean],
     attentionDropout: DropoutHyperParams[MultiHeadAttention.AttnWeights]
 )
 
@@ -396,7 +396,9 @@ case class ViTPatching(params: ViTPatchingParams):
     val x = projection(img) + positionalEncoding2D(projected.shape)
     x.flatten((Axis[Width], Axis[Height]))
 
-case class Timer private ():
+case class Timer private (
+    private val decay: Float = 0.01f
+):
 
   private var lastTime = System.currentTimeMillis()
   private var internalRunningAverage = -1f
@@ -407,7 +409,7 @@ case class Timer private ():
     internalRunningAverage =
       if internalRunningAverage == -1f
       then elapsed
-      else 0.9f * internalRunningAverage + 0.1f * elapsed
+      else internalRunningAverage * decay + elapsed * (1f - decay)
     lastTime = now
 
   def reset(): Unit =

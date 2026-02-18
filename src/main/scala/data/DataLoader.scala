@@ -15,6 +15,7 @@ import dimwit.tensor.Shape
 import RandomUtil.toSourceOfRandomness
 import scala.concurrent.Future
 import scala.concurrent.ExecutionContext
+import dimwit.tensor.DeviceBackend.GPU
 
 trait Data derives Label
 trait Width derives Label
@@ -176,7 +177,9 @@ case class Graph(nodes: List[RawNode], edges: List[RawEdge])
 
 case class RawSample(imgPos: Int, graph: Graph)
 case class Sample(image: Tensor[(Width, Height, Channel), Float], lineraizedGraph: Tensor1[DecoderContext, Int]):
-  def toGPU = Sample(image.toDevice(Device.GPU), lineraizedGraph.toDevice(Device.GPU))
+  def toGPU =
+    val deviceGPU = GPU.devices.head
+    Sample(image.toDevice(deviceGPU), lineraizedGraph.toDevice(deviceGPU))
 
 object ResPlanDataset:
   // 1. Load data via ScalaPy
@@ -217,7 +220,7 @@ case class ResPlanDataset(
     inifinite: Boolean = false
 ):
   private def rawSample2Sample(rawSample: RawSample, key: Random.Key): Sample =
-    val linearizedGraph = graphLinearization.linearize(rawSample.graph).toDevice(Device.CPU)
+    val linearizedGraph = graphLinearization.linearize(rawSample.graph)
     // val image = images.slice(Axis[Data].at(rawSample.imgPos)) // <-- leads to OOM
     val index = Tensor(Shape1(Axis[Data] -> 1)).fill(rawSample.imgPos)
     // slice with extra steps

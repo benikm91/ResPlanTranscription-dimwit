@@ -18,8 +18,12 @@ import resplan.util.PythonSetup
 import resplan.util.PythonHelper
 import dimwit.stats.Uniform
 import RandomUtil.toSourceOfRandomness
+import dimwit.tensor.DeviceBackend.{CPU, GPU}
+import java.sql.Time
 
 object Config:
+  inline val numberOfEncoderLayers = 4
+  inline val numberOfDecoderLayers = 4
   inline val learningRate = 1e-4f
   inline val beta1 = 0.9f
   inline val beta2 = 0.99f
@@ -27,18 +31,21 @@ object Config:
   inline val batchSize = 256
   inline val numberOfLayers = 6
   inline val numberOfHeads = 6
-  inline val extentEmbedding = 384
-  inline val dropout = 0.2
+  inline val embeddingExtent = 384
+  inline val decoderContextMaxLength = 32
+  inline val dropout = 0.1
+
+  inline val validationSetSize = 512
 
   inline val numIterations = 1_000_000
   inline val evaluationInterval = (10_240 / batchSize).toInt
 
   private inline def validateConfig: Unit =
-    inline if extentEmbedding % numberOfHeads != 0 then
+    inline if embeddingExtent % numberOfHeads != 0 then
       import scala.compiletime.{error, constValue}
       import scala.compiletime.ops.int.ToString
       scala.compiletime.error(
-        "Config Error: 'extentEmbedding' must be divisible by 'numberOfHeads', but got extentEmbedding = " + constValue[ToString[extentEmbedding.type]] + " and numberOfHeads = " + constValue[ToString[numberOfHeads.type]]
+        "Config Error: 'embeddingExtent' must be divisible by 'numberOfHeads', but got embeddingExtent = " + constValue[ToString[embeddingExtent.type]] + " and numberOfHeads = " + constValue[ToString[numberOfHeads.type]]
       )
 
   validateConfig
@@ -60,17 +67,15 @@ trait Batch derives Label
 import Util.given
 import resplan.data as Context
 
-val numberOfEncoderLayers = 4
-val numberOfDecoderLayers = 4
 val batchExtent = Axis[Batch] -> batchSize
-val headExtent = Axis[Head] -> 6
-val headQueryExtent = Axis[HeadQuery] -> 64
-val headKeyExtent = Axis[HeadKey] -> 64
-val headValueExtent = Axis[HeadValue] -> 64
-val encoderEmbeddingExtent = Axis[EncoderEmbedding] -> 384
+val headExtent = Axis[Head] -> numberOfHeads
+val headQueryExtent = Axis[HeadQuery] -> embeddingExtent / numberOfHeads
+val headKeyExtent = Axis[HeadKey] -> embeddingExtent / numberOfHeads
+val headValueExtent = Axis[HeadValue] -> embeddingExtent / numberOfHeads
+val encoderEmbeddingExtent = Axis[EncoderEmbedding] -> embeddingExtent
 val embeddingMixedExtent = Axis[EmbeddingMixed] -> 4 * encoderEmbeddingExtent.size
-val decoderContextExtent = Axis[DecoderContext] -> 32
-val decoderEmbeddingExtent = Axis[DecoderEmbedding] -> 384
+val decoderContextExtent = Axis[DecoderContext] -> decoderContextMaxLength
+val decoderEmbeddingExtent = Axis[DecoderEmbedding] -> embeddingExtent
 val patchWidthExtent = Axis[Width] -> 16
 val patchHeightExtent = Axis[Height] -> 16
 val channelExtent = Axis[Channel] -> 3
@@ -149,14 +154,11 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
     val encoderInputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
     val finalEncoderContext = encoder(encoderInputContext)
 
-    // Initialize the sequence with BOS (Beginning of Sequence) and Padding
     var finalOutputSeq = Tensor(Shape1(decoderContextExtent)).fill(paddingValue)
 
     // Autoregressive loop
-
     for i <- 0 until decoderContextExtent.size do
-      val currentInputSeq = shiftRight(finalOutputSeq).set(Axis[DecoderContext].at(0))(BOS)
-      val inputContext = embedder(currentInputSeq)
+      val inputContext = embedder(shiftRightBOS(finalOutputSeq))
       val finalContext = decoder(finalEncoderContext, inputContext)
 
       // Get logits for the CURRENT position only
@@ -180,7 +182,7 @@ object Sequence2SequenceModelHyperParams:
           outputDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
         ),
         attn = MultiHeadAttentionHyperParams(
-          attentionMasking = noMasking,
+          createAttentionMasking = noMask,
           attentionDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
         )
       ),
@@ -194,7 +196,7 @@ object Sequence2SequenceModelHyperParams:
             outputDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
           ),
           attn = MultiHeadAttentionHyperParams(
-            attentionMasking = causalMasking,
+            createAttentionMasking = causalMask,
             attentionDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
           )
         )
@@ -206,14 +208,15 @@ val Sequence2SequenceEvalModel = Sequence2SequenceModelFamily(Sequence2SequenceM
 
 case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], target: Tensor2[Batch, DecoderContext, Int]):
   def toGPU: BatchSample =
-    assert(image.device == Device.CPU)
-    assert(target.device == Device.CPU)
-    BatchSample(image.toDevice(Device.GPU), target.toDevice(Device.GPU))
+    val gpuDevice = GPU.devices.head
+    BatchSample(image.toDevice(gpuDevice), target.toDevice(gpuDevice))
 
 def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
-  val array = Jax.jnp.roll(target.jaxValue, shift = 1, axis = -1) // TODO add to dimwit
-  array.at.bracketAccess(0).set(BOS)
+  val array = Jax.jnp.roll(target.jaxValue, shift = 1, axis = -1)
   Tensor1.fromPy(Axis[DecoderContext], target.vtype)(array)
+
+def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
+  shiftRight(target).set(Axis[DecoderContext].at(0))(BOS)
 
 @main def train(): Unit =
   scalaRandom.setSeed(42)
@@ -223,9 +226,9 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
   // Filter plans that do not fit in the configured context size
   val validPlans = plans.filter(plan => plan.graph.nodes.size + plan.graph.edges.size * 3 + 2 < decoderContextExtent.size)
   println(f"Filtered plans from ${plans.size} to ${validPlans.size}")
-  val (trainPlans, valPlans) = validPlans.splitAt(7000) // (12800)
+  val (trainPlans, valPlans) = validPlans.splitAt(validPlans.size - validationSetSize)
   // Load planImages as lazy np.memmap representation
-  val planImages = Tensor.fromPy[(Data, Width, Height, Channel), Int](VType[Int])(Jax.jnp.asarray(PythonHelper.np.memmap("res/plans/20/plan_imgs.bin", dtype = PythonHelper.np.uint8, shape = (17107, 160, 160, 3), mode = "r"))).toDevice(Device.CPU)
+  val planImages = Tensor.fromPy[(Data, Width, Height, Channel), Int](VType[Int])(Jax.jnp.asarray(PythonHelper.np.memmap("res/plans/20/plan_imgs.bin", dtype = PythonHelper.np.uint8, shape = (17107, 160, 160, 3), mode = "r"))).toDevice(CPU.devices.head)
   val trainDataset = ResPlanDataset(
     trainPlans,
     planImages,
@@ -244,17 +247,29 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
     inifinite = false
   )
   val valSubset = valDataset.copy(plans = valPlans.take(32))
+
+  def augmentImage(image: Tensor3[Width, Height, Channel, Float], key: Tensor0[Random.Key]): Tensor3[Width, Height, Channel, Float] =
+    ImageAugmentation(image, key.item)
+
+  val jitAugmentImage = jit(augmentImage)
+
   val trainSampleStream = trainDataset
     .iterator
     .grouped(batchSize).withPartial(false)
     .zip(trainKey.toSourceOfRandomness)
     .map: (sample, trainKey) =>
-      val imageBatch = stack(sample.map(_.image), Axis[Batch])
-      val augImageBatch = zipvmap(Axis[Batch])(imageBatch, trainKey.splitToTensor(batchExtent)): (sample, key) =>
-        ImageAugmentation(sample, key.item)
+      val imageBatch = zipvmap(Axis[Batch])(
+        stack(sample.map(_.image), Axis[Batch]),
+        trainKey.splitToTensor(batchExtent)
+      ): (sample, key) =>
+        jitAugmentImage(sample, key)
       val targetBatch = stack(sample.map(_.lineraizedGraph), Axis[Batch])
-      BatchSample(augImageBatch, targetBatch)
-    .map(_.toGPU)
+      BatchSample(imageBatch, targetBatch).toGPU
+
+  /*val debugTimer = Timer.start()
+  for batch <- trainSampleStream do
+    debugTimer.tick()
+    println(f"s/batch: ${debugTimer.runningAvgSeconds}%.2f")*/
 
   val initParams = Sequence2SequenceModelParams.init(Random.Key(42))
 
@@ -311,7 +326,8 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
       graphLinearization: GraphLinearization
   ): (Tensor0[Float], GraphLinearizationScore) =
     val targets = sample.lineraizedGraph
-    val logits = jitLogits(params, sample.image, shiftRight(targets))
+    val logits = jitLogits(params, sample.image, shiftRightBOS(targets))
+    val valPredictionTeacherForcing = logits.argmax(Axis[Vocab])
     val valLoss = loss(logits, targets)
 
     val valPrediction = jitGenerate(params, sample.image)
@@ -319,6 +335,7 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
 
     println(f"Targets: $targets")
     println(f"Predict: $valPrediction")
+    println(f"Predict (TF): $valPredictionTeacherForcing")
     println(f"Score: $score")
 
     (valLoss, score)
@@ -330,7 +347,7 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
     samples.scanLeft(startState):
       case (state, sample) =>
         dimwit.gc()
-        jitStep(sample.image, sample.target.vmap(Axis[Batch])(shiftRight), sample.target, state)
+        jitStep(sample.image, sample.target.vmap(Axis[Batch])(shiftRightBOS), sample.target, state)
 
   def printScores(scores: List[(Float, GraphLinearizationScore)], iter: Int = -1): Unit =
     val macroValLoss = scores.map(_._1).sum / scores.size
@@ -351,10 +368,11 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
   val trainTrajectory = miniBatchGradientDescent(trainSampleStream, initState)
   val timer = Timer.start()
   println("Training...")
-  val finalState = trainTrajectory.zipWithIndex
+  val finalState = trainTrajectory
     .drop(1)
-    .tapEach:
+    .tapEvery(1):
       case (state, iter) =>
+        // Training report
         timer.tick()
         val secondsPerBatch = timer.runningAvgSeconds
         println(
@@ -365,20 +383,19 @@ def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, In
             f"loss: ${state.loss.item}%.2f"
           ).mkString(", ")
         )
-    .tapEach:
+    .tapEvery(evaluationInterval):
       case (state, iter) =>
-        if iter % evaluationInterval == 0 then
-          println("Evaluation...")
-          val scores = valSubset.iterator
-            .map(_.toGPU)
-            .map(sample =>
-              val (valLoss, score) = evaluate(sample, state.params, valGraphLinearization)
-              (valLoss.item, score)
-            ).toList
-          printScores(scores, iter = iter)
-          timer.reset()
+        // Evaluation Report
+        println("Evaluation...")
+        val scores = valSubset.iterator
+          .map(_.toGPU)
+          .map(sample =>
+            val (valLoss, score) = evaluate(sample, state.params, valGraphLinearization)
+            (valLoss.item, score)
+          ).toList
+        printScores(scores, iter = iter)
+        timer.reset()
     .drop(numIterations - 1) // iterate to final iteration
-    .map(t => t._1)
     .next()
 
   val scores = valDataset.iterator
