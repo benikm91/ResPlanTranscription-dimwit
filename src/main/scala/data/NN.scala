@@ -27,8 +27,6 @@ object Util:
         ta.fromPyTree(pyList.bracketAccess(i))
 
 import Util.vmap
-import resplan.data as Context
-import resplan.data as Embedding
 
 case class DropoutLayer[L: Label](hyperParams: DropoutHyperParams[L]) extends (Tensor1[L, Float] => Tensor1[L, Float]):
 
@@ -67,7 +65,7 @@ case class ProjectionLayerParams[In, Out](
 object ProjectionLayerParams:
   def init[In: Label, Out: Label](key: Random.Key, inExtent: AxisExtent[In], outExtent: AxisExtent[Out]): ProjectionLayerParams[In, Out] =
     ProjectionLayerParams(
-      weight = Normal.standardIsotropic(Shape(inExtent, outExtent), scale = 0.02f).sample(key)
+      weight = xavierNormal(Shape(inExtent, outExtent), key)
     )
 
 case class HeadsParams[Kind, Embedding](val weights: Tensor3[Head, Embedding, Kind, Float])
@@ -79,14 +77,24 @@ case class MultiHeadAttentionParams[Embedding](
     proj: LinearLayerParams[Head |*| HeadValue, Embedding]
 )
 
+def xavierScale(fanIn: Int, fanOut: Int): Float =
+  Math.sqrt(2.0 / (fanIn + fanOut).toDouble).toFloat
+
+def xavierNormal[FanIn: Label, FanOut: Label](shape: Shape2[FanIn, FanOut], key: Random.Key): Tensor2[FanIn, FanOut, Float] =
+  val scale = xavierScale(shape(Axis[FanIn]), shape(Axis[FanOut]))
+  Normal.standardIsotropic(shape, scale = scale).sample(key)
+
 object MultiHeadAttentionParams:
-  def init[Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[Embedding]): MultiHeadAttentionParams[Embedding] =
+  def init[Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[Embedding], numTransformerLayers: Int): MultiHeadAttentionParams[Embedding] =
+    val keys = key.split(4)
+    val nHeads = headExtent.size
+
     MultiHeadAttentionParams(
-      wq = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headQueryExtent), scale = 0.02f).sample(key)),
-      wk = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headKeyExtent), scale = 0.02f).sample(key)),
-      wv = HeadsParams(Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headValueExtent), scale = 0.02f).sample(key)),
+      wq = HeadsParams(stack(keys(0).split(nHeads).map(key => xavierNormal(Shape(embeddingExtent, headQueryExtent), key)), Axis[Head])),
+      wk = HeadsParams(stack(keys(1).split(nHeads).map(key => xavierNormal(Shape(embeddingExtent, headKeyExtent), key)), Axis[Head])),
+      wv = HeadsParams(stack(keys(2).split(nHeads).map(key => xavierNormal(Shape(embeddingExtent, headValueExtent), key)), Axis[Head])),
       proj = LinearLayerParams(
-        weight = Normal.standardIsotropic(Shape(headExtent * headValueExtent, embeddingExtent), scale = 0.02f).sample(key),
+        weight = xavierNormal(Shape(headExtent * headValueExtent, embeddingExtent), keys(3)) /! (2f * numTransformerLayers).sqrt,
         bias = Tensor(Shape(embeddingExtent)).fill(0f)
       )
     )
@@ -135,11 +143,11 @@ case class TransformerLayerParams[Embedding](
 )
 
 object TransformerLayerParams:
-  def init[E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[EmbeddingMixed]): TransformerLayerParams[E] =
+  def init[E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[EmbeddingMixed], numTransformerLayers: Int): TransformerLayerParams[E] =
     val (attnKey, mixKey) = key.split2()
     TransformerLayerParams[E](
       ln1 = LayerNormalizationParams.init(embeddingExtent),
-      attn = MultiHeadAttentionParams.init(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent),
+      attn = MultiHeadAttentionParams.init(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, numTransformerLayers = numTransformerLayers),
       ln2 = LayerNormalizationParams.init(embeddingExtent),
       embeddingMixer = EmbeddingMixerParams.init(mixKey, embeddingExtent, embeddingMixedExtent)
     )

@@ -30,7 +30,7 @@ object IteratorUtil:
       it
         .zipWithIndex
         .tapEach: (t, id) =>
-          if id % n == 0 then f(t, id)
+          if id % n == (n - 1) then f(t, id)
         .map(_._1)
 
 object RandomUtil:

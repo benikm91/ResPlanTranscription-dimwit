@@ -3,7 +3,9 @@ package resplan
 import dimwit.*
 import dimwit.Conversions.given
 import resplan.data.ResPlanDataset
-import resplan.data.RandomGraphLinearization
+import resplan.data.PaddedGraphLinearization
+import resplan.data.RandomNodeLinearization
+import resplan.data.RandomEdgeLinearization
 import resplan.util.PythonHelper
 import resplan.data.RawNode
 import resplan.data.RawEdge
@@ -24,7 +26,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
   val dataset = ResPlanDataset(
     plans,
     planImages,
-    RandomGraphLinearization(),
+    PaddedGraphLinearization(RandomNodeLinearization, RandomEdgeLinearization, 128),
     image =>
       image.asFloat /! 255f,
     Random.Key(42).toSourceOfRandomness
@@ -37,15 +39,15 @@ import scala.concurrent.ExecutionContext.Implicits.global
   val origGraph = plans.head.graph
   writeQuickDot(quickDot(origGraph), "orig.dot")
   println(origGraph.nodes.map(_.nodeName))
-  println(origGraph.edges.map(edge => f"${edge.fromNodeName} <-> ${edge.toNodeName}"))
+  println(origGraph.edges.map(edge => f"${edge.fromNode} <-> ${edge.toNode}"))
 
   println("Linearizing graph...")
   println(sample.lineraizedGraph)
 
   println("Unlinearizing graph...")
-  val graph = RandomGraphLinearization().strictUnlinearize(sample.lineraizedGraph).get
+  val graph = PaddedGraphLinearization(RandomNodeLinearization, RandomEdgeLinearization, 128).strictUnlinearize(sample.lineraizedGraph).get
   println(graph.nodes.map(_.nodeName))
-  println(graph.edges.map(edge => f"${edge.fromNodeName} <-> ${edge.toNodeName}"))
+  println(graph.edges.map(edge => f"${edge.fromNode} <-> ${edge.toNode}"))
 
   writeQuickDot(quickDot(graph), "unlineraized.dot")
 
@@ -74,5 +76,5 @@ def quickDot(graph: Graph): String =
   s"""graph G {
      |  layout=neato; overlap=false;
      |  ${graph.nodes.map(n => s""""${n.nodeName}";""").mkString("\n  ")}
-     |  ${graph.edges.map(e => s""""${e.fromNodeName}" -- "${e.toNodeName}" [label="${e.edgeClassName}"];""").mkString("\n  ")}
+     |  ${graph.edges.map(e => s""""${e.fromNode}" -- "${e.toNode}" [label="${e.edgeClassName}"];""").mkString("\n  ")}
      |}""".stripMargin

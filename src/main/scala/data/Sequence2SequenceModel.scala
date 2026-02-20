@@ -22,14 +22,13 @@ import dimwit.tensor.DeviceBackend.{CPU, GPU}
 import java.sql.Time
 
 object Config:
-  inline val numberOfEncoderLayers = 4
-  inline val numberOfDecoderLayers = 4
+  inline val numberOfEncoderLayers = 6
+  inline val numberOfDecoderLayers = 6
   inline val learningRate = 1e-4f
   inline val beta1 = 0.9f
   inline val beta2 = 0.99f
   inline val weightDecayFactor = 0.01f
   inline val batchSize = 256
-  inline val numberOfLayers = 6
   inline val numberOfHeads = 6
   inline val embeddingExtent = 384
   inline val decoderContextMaxLength = 32
@@ -65,7 +64,12 @@ trait DecoderContext derives Label
 trait EmbeddingMixed derives Label
 trait Batch derives Label
 import Util.given
-import resplan.data as Context
+
+// val nodeLinearization = RandomNodeLinearization
+// val edgeLinearization = RandomEdgeLinearization
+val nodeLinearization = SortedNodeLinearization
+// val edgeLinearization = SortedEdgeLinearization
+val edgeLinearization = NoEdgeLinearization
 
 val batchExtent = Axis[Batch] -> batchSize
 val headExtent = Axis[Head] -> numberOfHeads
@@ -102,21 +106,25 @@ object Sequence2SequenceModelParams:
     val positionalEmbeddingKey = keys(3)
     val vitPatchingKey = keys(4)
     val outputProjectionKey = keys(5)
+
+    val vocabScale = 1.0f / Math.sqrt(decoderEmbeddingExtent.size.toDouble).toFloat
+    val posScale = 1.0f / Math.sqrt(decoderEmbeddingExtent.size.toDouble).toFloat
+
     Sequence2SequenceModelParams(
       encoderLayers = encoderLayersKey.split(numberOfEncoderLayers).map(key =>
         val (attnKey, mixKey) = key.split2()
-        TransformerLayerParams.init(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, embeddingMixedExtent)
+        TransformerLayerParams.init(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, embeddingMixedExtent, numberOfEncoderLayers)
       ).toList,
       decoderLayer = decoderLayersKey.split(numberOfDecoderLayers).map(key =>
         val (crossAttentionKey, transformerKey) = key.split2()
         CrossTransformerLayerParams(
           crossAttentionPreNormalization = LayerNormalizationParams.init(decoderEmbeddingExtent),
           crossAttention = MultiHeadCrossAttentionParams.init(crossAttentionKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, decoderEmbeddingExtent),
-          transformer = TransformerLayerParams.init(transformerKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, decoderEmbeddingExtent, embeddingMixedExtent)
+          transformer = TransformerLayerParams.init(transformerKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, decoderEmbeddingExtent, embeddingMixedExtent, numberOfDecoderLayers)
         )
       ).toList,
-      vocabEmbedding = Normal.standardIsotropic(Shape(vocabExtent, decoderEmbeddingExtent), scale = 0.02f).sample(vocabEmbeddingKey),
-      positionalEmbeddings = Normal.standardIsotropic(Shape(decoderContextExtent, decoderEmbeddingExtent), scale = 0.02f).sample(positionalEmbeddingKey),
+      vocabEmbedding = Normal.standardIsotropic(Shape(vocabExtent, decoderEmbeddingExtent), scale = vocabScale).sample(vocabEmbeddingKey),
+      positionalEmbeddings = Normal.standardIsotropic(Shape(decoderContextExtent, decoderEmbeddingExtent), scale = posScale).sample(positionalEmbeddingKey),
       vitPatchingParams = ViTPatchingParams.init(vitPatchingKey, patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent),
       outputLayerNormalization = LayerNormalizationParams.init(decoderEmbeddingExtent),
       outputProjection = ProjectionLayerParams.init(outputProjectionKey, decoderEmbeddingExtent, vocabExtent)
@@ -232,12 +240,20 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   val trainDataset = ResPlanDataset(
     trainPlans,
     planImages,
-    RandomGraphLinearization(decoderContextExtent.size),
+    PaddedGraphLinearization(
+      nodeLinearization,
+      edgeLinearization,
+      decoderContextExtent.size
+    ),
     imageNormalization,
     trainKey.toSourceOfRandomness,
     inifinite = true
   )
-  val valGraphLinearization = RandomGraphLinearization(decoderContextExtent.size)
+  val valGraphLinearization = PaddedGraphLinearization(
+    nodeLinearization,
+    edgeLinearization,
+    decoderContextExtent.size
+  )
   val valDataset = ResPlanDataset(
     valPlans,
     planImages,
@@ -271,7 +287,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     debugTimer.tick()
     println(f"s/batch: ${debugTimer.runningAvgSeconds}%.2f")*/
 
-  val initParams = Sequence2SequenceModelParams.init(Random.Key(42))
+  val initParams = Sequence2SequenceModelParams.init(Random.Key.fromTime())
 
   val adam = Adam(learningRate = learningRate, b1 = beta1, b2 = beta2, epsilon = 1e-8f)
   val adamW = AdamW(adam, weightDecayFactor = weightDecayFactor)
