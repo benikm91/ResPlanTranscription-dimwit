@@ -15,7 +15,8 @@ import dimwit.tensor.Shape
 import RandomUtil.toSourceOfRandomness
 import scala.concurrent.Future
 import scala.concurrent.ExecutionContext
-import dimwit.tensor.DeviceBackend.GPU
+import dimwit.hardware.DeviceBackend.GPU
+import dimwit.python.PyBridge.toPyTensor
 
 trait Data derives Label
 trait Width derives Label
@@ -218,7 +219,7 @@ case class PaddedGraphLinearization(
 
   def strictUnlinearize(lineraizedGraph: Tensor1[DecoderContext, Int]): Try[Graph] =
     try
-      val tokens = py"list(${lineraizedGraph.jaxValue})".as[List[Int]].takeWhile(_ != EdgeClass.EndOfEdges.id)
+      val tokens = py"list(${toPyTensor(lineraizedGraph)})".as[List[Int]].takeWhile(_ != EdgeClass.EndOfEdges.id)
       val (nodeTokens, rest) = tokens.splitAt(tokens.indexOf(NodeClass.EndOfNodes.id))
       val edgeTokens = rest.tail // drop EndOfNodes token
       val nodes = nodeLineraization.toNodes(nodeTokens)

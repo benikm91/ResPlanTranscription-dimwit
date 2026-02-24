@@ -16,10 +16,17 @@ import scala.compiletime.ops.double
 import dimwit.jax.Jax
 import resplan.util.PythonSetup
 import resplan.util.PythonHelper
+import resplan.nn.{noMask, causalMask}
+import resplan.nn.{VocabularyEmbedder, TransformerBlock, TransformerLayer, CrossTransformerLayer, LinearLayer, LayerNorm, SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention, CrossTransformerBlock, MLPEmbeddingMixer, DropoutLayer}
 import dimwit.stats.Uniform
 import RandomUtil.toSourceOfRandomness
-import dimwit.tensor.DeviceBackend.{CPU, GPU}
+import dimwit.hardware.DeviceBackend.GPU
+import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
+
+import resplan.nn.Util.vmap
+
 import java.sql.Time
+import resplan.nn.VisitionTransformer2DPatching
 
 object Config:
   inline val numberOfEncoderLayers = 6
@@ -53,23 +60,20 @@ import Config.*
 import IteratorUtil.*
 
 trait Vocab derives Label
-trait Head derives Label
-trait HeadKey derives Label
-trait HeadQuery derives Label
-trait HeadValue derives Label
 trait EncoderEmbedding derives Label
 trait DecoderEmbedding derives Label
 trait EncoderContext derives Label
 trait DecoderContext derives Label
-trait EmbeddingMixed derives Label
 trait Batch derives Label
-import Util.given
 
 // val nodeLinearization = RandomNodeLinearization
 // val edgeLinearization = RandomEdgeLinearization
 val nodeLinearization = SortedNodeLinearization
 // val edgeLinearization = SortedEdgeLinearization
 val edgeLinearization = NoEdgeLinearization
+
+import resplan.nn.{Head, HeadQuery, HeadKey, HeadValue}
+import resplan.nn.MLPEmbeddingMixer.EmbeddingMixed
 
 val batchExtent = Axis[Batch] -> batchSize
 val headExtent = Axis[Head] -> numberOfHeads
@@ -88,24 +92,18 @@ val vocabExtent = Axis[Vocab] -> 64
 def imageNormalization(image: Tensor3[Width, Height, Channel, Int]): Tensor3[Width, Height, Channel, Float] = image.asFloat /! 255f
 
 case class Sequence2SequenceModelParams(
-    encoderLayers: List[TransformerLayerParams[EncoderEmbedding]],
-    decoderLayer: List[CrossTransformerLayerParams[EncoderEmbedding, DecoderEmbedding]],
+    encoderLayers: List[TransformerLayer.Params[EncoderEmbedding]],
+    decoderLayer: List[CrossTransformerLayer.Params[EncoderEmbedding, DecoderEmbedding]],
     vocabEmbedding: Tensor2[Vocab, DecoderEmbedding, Float],
     positionalEmbeddings: Tensor2[DecoderContext, DecoderEmbedding, Float],
-    vitPatchingParams: ViTPatchingParams,
-    outputLayerNormalization: LayerNormalizationParams[DecoderEmbedding],
-    outputProjection: ProjectionLayerParams[DecoderEmbedding, Vocab]
+    patchingParams: VisitionTransformer2DPatching.Params[Width, Height, Channel, EncoderEmbedding],
+    outputLayerNormalization: LayerNorm.Params[DecoderEmbedding],
+    outputProjection: LinearLayer.Params[DecoderEmbedding, Vocab]
 )
 
 object Sequence2SequenceModelParams:
   def init(key: Random.Key): Sequence2SequenceModelParams =
-    val keys = key.split(6)
-    val encoderLayersKey = keys(0)
-    val decoderLayersKey = keys(1)
-    val vocabEmbeddingKey = keys(2)
-    val positionalEmbeddingKey = keys(3)
-    val vitPatchingKey = keys(4)
-    val outputProjectionKey = keys(5)
+    val (encoderLayersKey, decoderLayersKey, vocabEmbeddingKey, positionalEmbeddingKey, vitPatchingKey, outputProjectionKey) = key.splitToTuple(6)
 
     val vocabScale = 1.0f / Math.sqrt(decoderEmbeddingExtent.size.toDouble).toFloat
     val posScale = 1.0f / Math.sqrt(decoderEmbeddingExtent.size.toDouble).toFloat
@@ -113,35 +111,34 @@ object Sequence2SequenceModelParams:
     Sequence2SequenceModelParams(
       encoderLayers = encoderLayersKey.split(numberOfEncoderLayers).map(key =>
         val (attnKey, mixKey) = key.split2()
-        TransformerLayerParams.init(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, embeddingMixedExtent, numberOfEncoderLayers)
+        TransformerLayer.Params.defaultInit(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, embeddingMixedExtent, numberOfEncoderLayers)
       ).toList,
       decoderLayer = decoderLayersKey.split(numberOfDecoderLayers).map(key =>
         val (crossAttentionKey, transformerKey) = key.split2()
-        CrossTransformerLayerParams(
-          crossAttentionPreNormalization = LayerNormalizationParams.init(decoderEmbeddingExtent),
-          crossAttention = MultiHeadCrossAttentionParams.init(crossAttentionKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, decoderEmbeddingExtent),
-          transformer = TransformerLayerParams.init(transformerKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, decoderEmbeddingExtent, embeddingMixedExtent, numberOfDecoderLayers)
+        CrossTransformerLayer.Params(
+          multiHeadCrossAttentionParams = MultiHeadCrossAttention.Params.defaultInit(crossAttentionKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, decoderEmbeddingExtent),
+          transformerParams = TransformerLayer.Params.defaultInit(transformerKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, decoderEmbeddingExtent, embeddingMixedExtent, numberOfDecoderLayers)
         )
       ).toList,
       vocabEmbedding = Normal.standardIsotropic(Shape(vocabExtent, decoderEmbeddingExtent), scale = vocabScale).sample(vocabEmbeddingKey),
       positionalEmbeddings = Normal.standardIsotropic(Shape(decoderContextExtent, decoderEmbeddingExtent), scale = posScale).sample(positionalEmbeddingKey),
-      vitPatchingParams = ViTPatchingParams.init(vitPatchingKey, patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent),
-      outputLayerNormalization = LayerNormalizationParams.init(decoderEmbeddingExtent),
-      outputProjection = ProjectionLayerParams.init(outputProjectionKey, decoderEmbeddingExtent, vocabExtent)
+      patchingParams = VisitionTransformer2DPatching.Params.defaultInit(vitPatchingKey, patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent),
+      outputLayerNormalization = LayerNorm.Params.defaultInit(decoderEmbeddingExtent),
+      outputProjection = LinearLayer.Params.defaultInit(decoderEmbeddingExtent, vocabExtent, outputProjectionKey)
     )
 
 case class Sequence2SequenceModelHyperParams(
-    encoderTransformerLayer: TransformerLayerHyperParams[EncoderContext, EncoderEmbedding],
-    decoderCrossTransformerLayer: CrossTransformerLayerHyperParams[EncoderContext, EncoderEmbedding, DecoderContext, DecoderEmbedding]
+    encoderTransformerLayer: TransformerLayer.HyperParams[EncoderContext, EncoderEmbedding],
+    decoderCrossTransformerLayer: CrossTransformerLayer.HyperParams[EncoderContext, DecoderContext, DecoderEmbedding]
 )
 
 case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyperParams)(params: Sequence2SequenceModelParams):
 
-  private val vitPatching = ViTPatching(params.vitPatchingParams)
-  private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer.fromParams(hyperParams.encoderTransformerLayer)))
-  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer.fromParams(hyperParams.decoderCrossTransformerLayer)))
-  private val embedder = Embedder(params.vocabEmbedding, params.positionalEmbeddings)
-  private val outputLayer = LayerNorm(params.outputLayerNormalization) andThen ProjectionLayer(params.outputProjection)
+  private val vitPatching = VisitionTransformer2DPatching(params.patchingParams)
+  private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer.WithPostNorm(hyperParams.encoderTransformerLayer)))
+  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer(hyperParams.decoderCrossTransformerLayer)))
+  private val embedder = vmap(Axis[DecoderContext])(VocabularyEmbedder(params.vocabEmbedding))
+  private val outputLayer = LayerNorm(params.outputLayerNormalization) andThen LinearLayer(params.outputProjection)
 
   def logits(img: Tensor3[Width, Height, Channel, Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
     val flatPatches = vitPatching(img)
@@ -182,30 +179,30 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
 
 object Sequence2SequenceModelHyperParams:
   def apply(key: Random.Key, isTraining: Boolean): Sequence2SequenceModelHyperParams =
-    val keys = key.split(7).iterator
+    val keys = key.toSourceOfRandomness
     new Sequence2SequenceModelHyperParams(
-      encoderTransformerLayer = TransformerLayerHyperParams(
-        embeddingMixer = EmbeddingMixerHyperParams(
-          hiddenDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-          outputDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
+      encoderTransformerLayer = TransformerLayer.HyperParams(
+        embeddingMixer = MLPEmbeddingMixer.HyperParams(
+          hiddenDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
+          outputDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
+          gelu
         ),
-        attn = MultiHeadAttentionHyperParams(
-          createAttentionMasking = noMask,
-          attentionDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
+        multiHeadAttention = MultiHeadAttention.HyperParams(
+          SelfAttention.HyperParams(createAttentionMask = noMask)
         )
       ),
-      decoderCrossTransformerLayer = CrossTransformerLayerHyperParams(
-        crossAttention = MultiHeadCrossAttentionHyperParams(
-          DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
+      decoderCrossTransformerLayer = CrossTransformerLayer.HyperParams(
+        multiHeadCrossAttention = MultiHeadCrossAttention.HyperParams(
+          CrossAttention.HyperParams(createAttentionMask = noMask)
         ),
-        transformer = TransformerLayerHyperParams(
-          embeddingMixer = EmbeddingMixerHyperParams(
-            hiddenDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-            outputDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
+        transformer = TransformerLayer.HyperParams(
+          embeddingMixer = MLPEmbeddingMixer.HyperParams(
+            hiddenDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
+            outputDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
+            gelu
           ),
-          attn = MultiHeadAttentionHyperParams(
-            createAttentionMasking = causalMask,
-            attentionDropout = DropoutHyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining)
+          multiHeadAttention = MultiHeadAttention.HyperParams(
+            SelfAttention.HyperParams(createAttentionMask = causalMask)
           )
         )
       )
@@ -220,8 +217,8 @@ case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], ta
     BatchSample(image.toDevice(gpuDevice), target.toDevice(gpuDevice))
 
 def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
-  val array = Jax.jnp.roll(target.jaxValue, shift = 1, axis = -1)
-  Tensor1.fromPy(Axis[DecoderContext], target.vtype)(array)
+  val array = Jax.jnp.roll(toPyTensor(target), shift = 1, axis = -1)
+  liftPyTensor1(Axis[DecoderContext], target.vtype)(array)
 
 def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
   shiftRight(target).set(Axis[DecoderContext].at(0))(BOS)
@@ -236,7 +233,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   println(f"Filtered plans from ${plans.size} to ${validPlans.size}")
   val (trainPlans, valPlans) = validPlans.splitAt(validPlans.size - validationSetSize)
   // Load planImages as lazy np.memmap representation
-  val planImages = Tensor.fromPy[(Data, Width, Height, Channel), Int](VType[Int])(Jax.jnp.asarray(PythonHelper.np.memmap("res/plans/20/plan_imgs.bin", dtype = PythonHelper.np.uint8, shape = (17107, 160, 160, 3), mode = "r"))).toDevice(CPU.devices.head)
+  val planImages = liftPyTensor[(Data, Width, Height, Channel), Int](Jax.jnp.asarray(PythonHelper.np.memmap("res/plans/20/plan_imgs.bin", dtype = PythonHelper.np.uint8, shape = (17107, 160, 160, 3), mode = "r")))
   val trainDataset = ResPlanDataset(
     trainPlans,
     planImages,

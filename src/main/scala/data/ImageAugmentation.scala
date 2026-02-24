@@ -6,6 +6,7 @@ import dimwit.stats.Uniform
 import dimwit.stats.Bernoulli
 import dimwit.jax.Jax
 import dimwit.stats.Categorical
+import dimwit.python.PyBridge.{toPyTensor, liftPyTensor}
 
 object ImageAugmentation:
 
@@ -20,32 +21,32 @@ object ImageAugmentation:
   private val rotationAngleDist = Uniform(Tensor0(0), Tensor0(3))
 
   def apply(image: Tensor3[Width, Height, Channel, Float], key: Random.Key): Tensor3[Width, Height, Channel, Float] =
-    val keys = key.split(5)
+    val (zoomFactorKey, relShiftKey, flipHKey, flipVKey, rotationKey) = key.splitToTuple(5)
     val width = image.shape(Axis[Width]).toFloat
     val height = image.shape(Axis[Height]).toFloat
-    val zoomFactor = zoomFactorDist.sample(keys(0))
+    val zoomFactor = zoomFactorDist.sample(zoomFactorKey)
     val dim = Tensor1(Axis[A]).fromArray(Array(width, height))
-    val shift = dim * relShiftDist.sample(keys(1))
+    val shift = dim * relShiftDist.sample(relShiftKey)
     val center = dim /! 2f
     val totalTranslation = center - (center / zoomFactor) + shift
     val invImage = 1f -! image
     var x = jaxImage.scale_and_translate(
-      invImage.jaxValue,
+      toPyTensor(invImage),
       shape = (160, 160, 3),
       spatial_dims = (0, 1),
-      scale = zoomFactor.jaxValue,
-      translation = totalTranslation.jaxValue,
+      scale = toPyTensor(zoomFactor),
+      translation = toPyTensor(totalTranslation),
       method = "bilinear"
     )
 
-    val doFlipH = flipHDist.sample(keys(2))
-    val doFlipV = flipVDist.sample(keys(3))
+    val doFlipH = flipHDist.sample(flipHKey)
+    val doFlipV = flipVDist.sample(flipVKey)
 
-    x = Jax.jnp.where(doFlipH.jaxValue, Jax.jnp.fliplr(x), x)
-    x = Jax.jnp.where(doFlipV.jaxValue, Jax.jnp.flipud(x), x)
+    x = Jax.jnp.where(toPyTensor(doFlipH), Jax.jnp.fliplr(x), x)
+    x = Jax.jnp.where(toPyTensor(doFlipV), Jax.jnp.flipud(x), x)
 
     // Rotate 0, 90, 180, 270 degrees
-    val rotation = rotationAngleDist.sample(keys(4))
+    val rotation = rotationAngleDist.sample(rotationKey)
     // TODO
 
-    1f -! Tensor.fromPy(VType[Float])(x)
+    1f -! liftPyTensor(x)

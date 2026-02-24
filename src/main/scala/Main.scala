@@ -17,10 +17,11 @@ import dimwit.jax.Jax
 import resplan.data.ImageAugmentation
 import resplan.data.RandomUtil.toSourceOfRandomness
 import scala.concurrent.ExecutionContext.Implicits.global
+import dimwit.python.PyBridge
 
 @main def dataExample(): Unit =
   val plans = ResPlanDataset.loadRawPlans()
-  val planImages = Tensor.fromPy[(Data, Width, Height, Channel), Int](VType[Int])(
+  val planImages = PyBridge.liftPyTensor[(Data, Width, Height, Channel), Int](
     Jax.jnp.asarray(PythonHelper.np.memmap("res/plans/20/plan_imgs.bin", dtype = PythonHelper.np.uint8, shape = (17107, 160, 160, 3), mode = "r"))
   )
   val dataset = ResPlanDataset(
@@ -59,11 +60,11 @@ import scala.concurrent.ExecutionContext.Implicits.global
 
   plt.figure(figsize = (15, 15))
   plt.subplot(numRows, numCols, 1)
-  plt.imshow(sample.image.jaxValue)
+  plt.imshow(PyBridge.toPyTensor(sample.image))
   for (i, augKey) <- (2 to totalAugs).zip(Random.Key(42).toSourceOfRandomness) do
     val augImage = ImageAugmentation(sample.image, augKey)
     plt.subplot(numRows, numCols, i)
-    plt.imshow(augImage.jaxValue)
+    plt.imshow(PyBridge.toPyTensor(augImage))
   plt.tight_layout()
   plt.show()
 
