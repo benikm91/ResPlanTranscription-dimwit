@@ -115,9 +115,16 @@ object Sequence2SequenceModelParams:
       ).toList,
       decoderLayer = decoderLayersKey.split(numberOfDecoderLayers).map(key =>
         val (crossAttentionKey, transformerKey) = key.split2()
-        CrossTransformerLayer.Params(
-          multiHeadCrossAttentionParams = MultiHeadCrossAttention.Params.defaultInit(crossAttentionKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, decoderEmbeddingExtent),
-          transformerParams = TransformerLayer.Params.defaultInit(transformerKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, decoderEmbeddingExtent, embeddingMixedExtent, numberOfDecoderLayers)
+        CrossTransformerLayer.Params.defaultInit(
+          crossAttentionKey,
+          headExtent,
+          headQueryExtent,
+          headKeyExtent,
+          headValueExtent,
+          encoderEmbeddingExtent,
+          decoderEmbeddingExtent,
+          embeddingMixedExtent,
+          numberOfDecoderLayers
         )
       ).toList,
       vocabEmbedding = Normal.standardIsotropic(Shape(vocabExtent, decoderEmbeddingExtent), scale = vocabScale).sample(vocabEmbeddingKey),
@@ -136,7 +143,7 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
 
   private val vitPatching = VisitionTransformer2DPatching(params.patchingParams)
   private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer.WithPostNorm(hyperParams.encoderTransformerLayer)))
-  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer(hyperParams.decoderCrossTransformerLayer)))
+  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer.WithPostNorm(hyperParams.decoderCrossTransformerLayer)))
   private val embedder = vmap(Axis[DecoderContext])(VocabularyEmbedder(params.vocabEmbedding))
   private val outputLayer = LayerNorm(params.outputLayerNormalization) andThen LinearLayer(params.outputProjection)
 
@@ -195,15 +202,13 @@ object Sequence2SequenceModelHyperParams:
         multiHeadCrossAttention = MultiHeadCrossAttention.HyperParams(
           CrossAttention.HyperParams(createAttentionMask = noMask)
         ),
-        transformer = TransformerLayer.HyperParams(
-          embeddingMixer = MLPEmbeddingMixer.HyperParams(
-            hiddenDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-            outputDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-            gelu
-          ),
-          multiHeadAttention = MultiHeadAttention.HyperParams(
-            SelfAttention.HyperParams(createAttentionMask = causalMask)
-          )
+        embeddingMixer = MLPEmbeddingMixer.HyperParams(
+          hiddenDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
+          outputDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
+          gelu
+        ),
+        multiHeadAttention = MultiHeadAttention.HyperParams(
+          SelfAttention.HyperParams(createAttentionMask = causalMask)
         )
       )
     )

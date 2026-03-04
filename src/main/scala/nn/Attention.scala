@@ -48,7 +48,7 @@ trait ISelfAttention[Context: Label, Embedding: Label, Q: Label, K: Label, V: La
     res
 
 case class SelfAttention[Context: Label, Embedding: Label, Q: Label, K: Label, V: Label](
-    hyperParams: SelfAttention.HyperParams[Context, Q, K]
+    hyperParams: SelfAttention.HyperParams[Context]
 )(
     params: SelfAttention.BaseParams[Embedding, Q, K, V]
 ) extends ISelfAttention[Context, Embedding, Q, K, V]:
@@ -69,7 +69,7 @@ case class SelfAttention[Context: Label, Embedding: Label, Q: Label, K: Label, V
 
 object SelfAttention:
 
-  case class HyperParams[Context, Q, K](
+  case class HyperParams[Context](
       createAttentionMask: Shape2[Context, Prime[Context]] => Tensor[(Context, Prime[Context]), Boolean]
       // calculateAttentionWeights: (Tensor2[Context, Q, Float], Tensor2[Context, K, Float]) => Tensor2[Context, AttentionWeights, Float]
   )
@@ -108,7 +108,7 @@ trait ICrossAttention[CrossContext: Label, CrossEmbedding: Label, Context: Label
     res
 
 case class CrossAttention[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label, Q: Label, K: Label, V: Label](
-    hyperParams: CrossAttention.HyperParams[CrossContext, Context, Q, K]
+    hyperParams: CrossAttention.HyperParams[CrossContext, Context]
 )(
     params: CrossAttention.BaseParams[CrossEmbedding, Embedding, Q, K, V]
 ) extends ICrossAttention[CrossContext, CrossEmbedding, Context, Embedding, Q, K, V]:
@@ -129,7 +129,7 @@ case class CrossAttention[CrossContext: Label, CrossEmbedding: Label, Context: L
 
 object CrossAttention:
 
-  case class HyperParams[CrossContext, Context, Q, K](
+  case class HyperParams[CrossContext, Context](
       createAttentionMask: Shape2[Context, CrossContext] => Tensor2[Context, CrossContext, Boolean]
   )
 
@@ -185,7 +185,7 @@ case class MultiHeadAttention[Context: Label, Embedding: Label](
 object MultiHeadAttention:
 
   case class HyperParams[Context](
-      headAttention: SelfAttention.HyperParams[Context, HeadQuery, HeadKey]
+      headAttention: SelfAttention.HyperParams[Context]
   )
 
   case class Params[Embedding](
@@ -196,7 +196,7 @@ object MultiHeadAttention:
   )
 
   object Params:
-    def defaultInit[Context: Label, Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[Embedding], numTransformerLayers: Int): Params[Embedding] =
+    def defaultInit[Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[Embedding], numTransformerLayers: Int): Params[Embedding] =
       val (queryKey, keyKey, valueKey, projectionKey) = key.splitToTuple(4)
       val nHeads = headExtent.size
       Params(
@@ -235,7 +235,7 @@ case class MultiHeadCrossAttention[CrossContext: Label, CrossEmbedding: Label, C
 object MultiHeadCrossAttention:
 
   case class HyperParams[CrossContext, Context](
-      val headAttention: CrossAttention.HyperParams[CrossContext, Context, HeadQuery, HeadKey]
+      val headAttention: CrossAttention.HyperParams[CrossContext, Context]
   )
 
   case class Params[CrossEmbedding, Embedding](
