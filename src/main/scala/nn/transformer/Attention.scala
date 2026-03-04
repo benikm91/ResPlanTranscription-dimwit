@@ -1,9 +1,11 @@
-package resplan.nn
+package resplan.nn.transformer
 
 import dimwit.*
 import dimwit.Conversions.given
 import nn.ActivationFunctions.softmax
 import dimwit.stats.Normal
+import resplan.nn.base.{DropoutLayer, AffineLayer, LinearLayer}
+import resplan.nn.init.xavierNormal
 
 trait Query derives Label
 trait Key derives Label

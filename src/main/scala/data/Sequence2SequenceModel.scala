@@ -16,14 +16,16 @@ import scala.compiletime.ops.double
 import dimwit.jax.Jax
 import resplan.util.PythonSetup
 import resplan.util.PythonHelper
-import resplan.nn.{noMask, causalMask}
-import resplan.nn.{VocabularyEmbedder, TransformerBlock, TransformerLayer, CrossTransformerLayer, LinearLayer, LayerNorm, SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention, CrossTransformerBlock, MLPEmbeddingMixer, DropoutLayer}
+import resplan.nn.transformer.{noMask, causalMask}
+import resplan.nn.VocabularyEmbedder
+import resplan.nn.base.{DropoutLayer, LinearLayer}
+import resplan.nn.normalization.LayerNorm
+import resplan.nn.transformer.{SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention}
+import resplan.nn.transformer.{TransformerBlock, TransformerLayer, CrossTransformerLayer, CrossTransformerBlock, MLPEmbeddingMixer}
 import dimwit.stats.Uniform
 import RandomUtil.toSourceOfRandomness
 import dimwit.hardware.DeviceBackend.GPU
 import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
-
-import resplan.nn.Util.vmap
 
 import java.sql.Time
 import resplan.nn.VisitionTransformer2DPatching
@@ -72,8 +74,8 @@ val nodeLinearization = SortedNodeLinearization
 // val edgeLinearization = SortedEdgeLinearization
 val edgeLinearization = NoEdgeLinearization
 
-import resplan.nn.{Head, HeadQuery, HeadKey, HeadValue}
-import resplan.nn.MLPEmbeddingMixer.EmbeddingMixed
+import resplan.nn.transformer.{Head, HeadQuery, HeadKey, HeadValue}
+import resplan.nn.transformer.MLPEmbeddingMixer.EmbeddingMixed
 
 val batchExtent = Axis[Batch] -> batchSize
 val headExtent = Axis[Head] -> numberOfHeads
@@ -144,14 +146,14 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
   private val vitPatching = VisitionTransformer2DPatching(params.patchingParams)
   private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer.WithPostNorm(hyperParams.encoderTransformerLayer)))
   private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer.WithPostNorm(hyperParams.decoderCrossTransformerLayer)))
-  private val embedder = vmap(Axis[DecoderContext])(VocabularyEmbedder(params.vocabEmbedding))
+  private val embedder = VocabularyEmbedder(params.vocabEmbedding)
   private val outputLayer = LayerNorm(params.outputLayerNormalization) andThen LinearLayer(params.outputProjection)
 
   def logits(img: Tensor3[Width, Height, Channel, Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
     val flatPatches = vitPatching(img)
     val encoderInputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
     val finalEncoderContext = encoder(encoderInputContext)
-    val inputContext = embedder(shiftedTargets)
+    val inputContext = shiftedTargets.vmap(Axis[DecoderContext])(embedder)
     val finalContext = decoder(finalEncoderContext, inputContext)
     finalContext.vmap(Axis[DecoderContext])(outputLayer)
 
@@ -170,7 +172,7 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
 
     // Autoregressive loop
     for i <- 0 until decoderContextExtent.size do
-      val inputContext = embedder(shiftRightBOS(finalOutputSeq))
+      val inputContext = shiftRightBOS(finalOutputSeq).vmap(Axis[DecoderContext])(embedder)
       val finalContext = decoder(finalEncoderContext, inputContext)
 
       // Get logits for the CURRENT position only

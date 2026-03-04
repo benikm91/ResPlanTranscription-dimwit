@@ -1,4 +1,4 @@
-package resplan.nn
+package resplan.nn.init
 
 import dimwit.*
 import dimwit.Conversions.given

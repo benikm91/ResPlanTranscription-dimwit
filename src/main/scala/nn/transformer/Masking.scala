@@ -1,4 +1,4 @@
-package resplan.nn
+package resplan.nn.transformer
 
 import dimwit.*
 

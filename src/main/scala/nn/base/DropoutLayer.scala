@@ -1,4 +1,4 @@
-package resplan.nn
+package resplan.nn.base
 
 import dimwit.*
 import dimwit.stats.Bernoulli

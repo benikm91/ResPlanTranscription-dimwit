@@ -1,6 +1,7 @@
-package resplan.nn
+package resplan.nn.base
 
 import dimwit.*
+import resplan.nn.init.xavierNormal
 
 case class LinearLayer[In: Label, Out: Label](params: LinearLayer.Params[In, Out]) extends (Tensor1[In, Float] => Tensor1[Out, Float]):
   override def apply(x: Tensor1[In, Float]): Tensor1[Out, Float] =
