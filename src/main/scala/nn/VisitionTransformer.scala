@@ -28,10 +28,10 @@ case class VisitionTransformer2DPatching[
     params: VisitionTransformer2DPatching.Params[Width, Height, Channel, PatchEmbedding]
 ) extends IVisitionTransformer2DPatching[Width, Height, Channel, PatchEmbedding]:
 
-  val encodeToPatches =
+  override def encodeToPatches(img: Tensor[(Width, Height, Channel), Float]): Tensor[(Width, Height, PatchEmbedding), Float] =
     val weightShape = params.projectionWeights.shape
     val kernelSize = (weightShape.extent(Axis[Width]), weightShape.extent(Axis[Height]))
-    Conv2DLayer(Conv2DLayer.Params(params.projectionWeights), stride = kernelSize)
+    Conv2DLayer(Conv2DLayer.Params(params.projectionWeights), stride = kernelSize)(img)
 
   def add2DPositionalEncoding(patches: Tensor[(Width, Height, PatchEmbedding), Float]): Tensor[(Width, Height, PatchEmbedding), Float] =
     positionalEncoding2D(patches.shape) + patches
@@ -62,7 +62,7 @@ case class VisitionTransformer2DPatching[
 
 object VisitionTransformer2DPatching:
 
-  case class Params[PatchWidth: Label, PatchHeight: Label, Channel: Label, PatchEmbedding: Label](
+  case class Params[PatchWidth, PatchHeight, Channel, PatchEmbedding](
       projectionWeights: Tensor[(PatchWidth, PatchHeight, Channel, PatchEmbedding), Float]
   )
 

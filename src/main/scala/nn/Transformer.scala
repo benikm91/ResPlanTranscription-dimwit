@@ -54,16 +54,24 @@ object TransformerLayer:
   )(
       params: TransformerLayer.Params[Embedding]
   ) extends TransformerLayer[Context, Embedding](hyperParams)(params):
-    override val embeddingMixer = attentionPreNormalization andThen baseEmbeddingMixer
-    override val contentMixer = embeddingMixerPreNormalization andThen baseContextMixer
+
+    override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
+      (attentionPreNormalization andThen baseEmbeddingMixer)(embeddings)
+
+    override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+      (embeddingMixerPreNormalization andThen baseContextMixer)(context)
 
   case class WithPostNorm[Context: Label, Embedding: Label](
       hyperParams: TransformerLayer.HyperParams[Context, Embedding]
   )(
       params: TransformerLayer.Params[Embedding]
   ) extends TransformerLayer[Context, Embedding](hyperParams)(params):
-    override def embeddingMixer = baseEmbeddingMixer andThen attentionPreNormalization
-    override def contextMixer = baseContextMixer andThen embeddingMixerPreNormalization
+
+    override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
+      (baseEmbeddingMixer andThen attentionPreNormalization)(embeddings)
+
+    override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+      (baseContextMixer andThen embeddingMixerPreNormalization)(context)
 
   case class HyperParams[Context: Label, Embedding: Label](
       embeddingMixer: MLPEmbeddingMixer.HyperParams[Embedding],
@@ -78,6 +86,7 @@ object TransformerLayer:
   )
 
   object Params:
+
     def defaultInit[E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[MLPEmbeddingMixer.EmbeddingMixed], numTransformerLayers: Int): Params[E] =
       val (attnKey, mixKey) = key.split2()
       new Params[E](
@@ -93,7 +102,10 @@ case class CrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Con
     params: CrossTransformerLayer.Params[CrossEmbedding, Embedding]
 ) extends ICrossTransformerLayer[CrossContext, CrossEmbedding, Context, Embedding]:
 
-  override val crossContextMixer = new MultiHeadCrossAttention(hyperParams.multiHeadCrossAttention)(params.multiHeadCrossAttentionParams)
+  private val multiHeadCrossAttention = new MultiHeadCrossAttention(hyperParams.multiHeadCrossAttention)(params.multiHeadCrossAttentionParams)
+
+  override def crossContextMixer(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+    multiHeadCrossAttention(crossContext, context)
   override val transformerLayer = new TransformerLayer.WithPostNorm(hyperParams.transformer)(params.transformerParams)
 
 object CrossTransformerLayer:
@@ -103,7 +115,7 @@ object CrossTransformerLayer:
       multiHeadCrossAttention: MultiHeadCrossAttention.HyperParams[CrossContext, Context]
   )
 
-  case class Params[CrossEmbedding: Label, Embedding: Label](
+  case class Params[CrossEmbedding, Embedding](
       multiHeadCrossAttentionParams: MultiHeadCrossAttention.Params[CrossEmbedding, Embedding],
       transformerParams: TransformerLayer.Params[Embedding]
   )
@@ -141,7 +153,7 @@ object MLPEmbeddingMixer:
         outputDropout: DropoutLayer.HyperParams[Embedding]
     ) = new HyperParams(hiddenDropout, outputDropout, gelu)
 
-  case class Params[Embedding: Label](
+  case class Params[Embedding](
       c_fc: AffineLayer.Params[Embedding, EmbeddingMixed],
       c_proj: AffineLayer.Params[EmbeddingMixed, Embedding]
   )

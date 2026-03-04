@@ -99,7 +99,7 @@ case class Sequence2SequenceModelParams(
     patchingParams: VisitionTransformer2DPatching.Params[Width, Height, Channel, EncoderEmbedding],
     outputLayerNormalization: LayerNorm.Params[DecoderEmbedding],
     outputProjection: LinearLayer.Params[DecoderEmbedding, Vocab]
-)
+) derives ToPyTree
 
 object Sequence2SequenceModelParams:
   def init(key: Random.Key): Sequence2SequenceModelParams =

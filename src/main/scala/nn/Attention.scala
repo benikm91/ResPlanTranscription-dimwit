@@ -53,9 +53,9 @@ case class SelfAttention[Context: Label, Embedding: Label, Q: Label, K: Label, V
     params: SelfAttention.BaseParams[Embedding, Q, K, V]
 ) extends ISelfAttention[Context, Embedding, Q, K, V]:
 
-  override val encodeToQuery = LinearLayer(params.wq)
-  override val encodeToKey = LinearLayer(params.wk)
-  override val encodeToValue = LinearLayer(params.wv)
+  override def encodeToQuery(embedding: Tensor1[Embedding, Float]) = LinearLayer(params.wq)(embedding)
+  override def encodeToKey(embedding: Tensor1[Embedding, Float]) = LinearLayer(params.wk)(embedding)
+  override def encodeToValue(embedding: Tensor1[Embedding, Float]) = LinearLayer(params.wv)(embedding)
 
   def calculateAttentionScores(queries: Tensor2[Context, Q, Float], keys: Tensor2[Context, K, Float]): Tensor2[Context, Prime[Context], Float] =
     val dk = Math.sqrt(keys.shape(Axis[K])).toFloat
@@ -113,9 +113,9 @@ case class CrossAttention[CrossContext: Label, CrossEmbedding: Label, Context: L
     params: CrossAttention.BaseParams[CrossEmbedding, Embedding, Q, K, V]
 ) extends ICrossAttention[CrossContext, CrossEmbedding, Context, Embedding, Q, K, V]:
 
-  override val encodeQuery = LinearLayer(params.wq)
-  override val encodeKey = LinearLayer(params.wk)
-  override val encodeValue = LinearLayer(params.wv)
+  override def encodeToQuery(embedding: Tensor1[Embedding, Float]) = LinearLayer(params.wq)(embedding)
+  override def encodeToKey(embedding: Tensor1[CrossEmbedding, Float]) = LinearLayer(params.wk)(embedding)
+  override def encodeToValue(embedding: Tensor1[CrossEmbedding, Float]) = LinearLayer(params.wv)(embedding)
 
   def calculateAttentionScores(queries: Tensor2[Context, Q, Float], keys: Tensor2[CrossContext, K, Float]): Tensor2[Context, CrossContext, Float] =
     val dk = Math.sqrt(keys.shape(Axis[K])).toFloat
@@ -159,8 +159,8 @@ trait HeadValue derives Label
 
 trait IMultiHeadSelfAttention[Context: Label, Embedding: Label] extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
 
-  def headAttention: Tensor2[Context, Embedding, Float] => Tensor[(Head, Context, HeadValue), Float]
-  def headProjection: Tensor1[Head |*| HeadValue, Float] => Tensor1[Embedding, Float]
+  def headAttention(context: Tensor2[Context, Embedding, Float]): Tensor[(Head, Context, HeadValue), Float]
+  def headProjection(headValues: Tensor1[Head |*| HeadValue, Float]): Tensor1[Embedding, Float]
 
   override def apply(x: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
     val heads = headAttention(x)
@@ -172,13 +172,15 @@ case class MultiHeadAttention[Context: Label, Embedding: Label](
     params: MultiHeadAttention.Params[Embedding]
 ) extends IMultiHeadSelfAttention[Context, Embedding]:
 
-  def headAttention(context: Tensor2[Context, Embedding, Float]) =
+  private val headProjectionLayer = AffineLayer(params.headProjection)
+
+  override def headAttention(context: Tensor2[Context, Embedding, Float]): Tensor[(Head, Context, HeadValue), Float] =
     zipvmap(Axis[Head])(params.wq, params.wk, params.wv):
       case (wq, wk, wv) =>
         val attention = SelfAttention(hyperParams.headAttention)(SelfAttention.BaseParams(wq, wk, wv))
         attention(context)
 
-  val headProjection = AffineLayer(params.headProjection)
+  override def headProjection(headValues: Tensor1[Head |*| HeadValue, Float]) = headProjectionLayer(headValues)
 
 object MultiHeadAttention:
 
@@ -186,7 +188,7 @@ object MultiHeadAttention:
       headAttention: SelfAttention.HyperParams[Context, HeadQuery, HeadKey]
   )
 
-  case class Params[Embedding: Label](
+  case class Params[Embedding](
       wq: Tensor3[Head, Embedding, HeadQuery, Float],
       wk: Tensor3[Head, Embedding, HeadKey, Float],
       wv: Tensor3[Head, Embedding, HeadValue, Float],
@@ -209,8 +211,8 @@ object MultiHeadAttention:
 
 trait IMultiHeadCrossAttention[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label] extends ((Tensor2[CrossContext, CrossEmbedding, Float], Tensor2[Context, Embedding, Float]) => Tensor2[Context, Embedding, Float]):
 
-  def headAttention: (Tensor2[CrossContext, CrossEmbedding, Float], Tensor2[Context, Embedding, Float]) => Tensor[(Head, Context, HeadValue), Float]
-  def headProjection: Tensor1[Head |*| HeadValue, Float] => Tensor1[Embedding, Float]
+  def headAttention(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor[(Head, Context, HeadValue), Float]
+  def headProjection(headValues: Tensor1[Head |*| HeadValue, Float]): Tensor1[Embedding, Float]
 
   override def apply(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
     val heads = headAttention(crossContext, context)
@@ -228,7 +230,7 @@ case class MultiHeadCrossAttention[CrossContext: Label, CrossEmbedding: Label, C
         val headAttention = CrossAttention(hyperParams.headAttention)(CrossAttention.BaseParams(wq, wk, wv))
         headAttention(crossContext, context)
 
-  override val headProjection = AffineLayer(params.headProjection)
+  override def headProjection(headValues: Tensor1[Head |*| HeadValue, Float]) = AffineLayer(params.headProjection)(headValues)
 
 object MultiHeadCrossAttention:
 
@@ -236,7 +238,7 @@ object MultiHeadCrossAttention:
       val headAttention: CrossAttention.HyperParams[CrossContext, Context, HeadQuery, HeadKey]
   )
 
-  case class Params[CrossEmbedding: Label, Embedding: Label](
+  case class Params[CrossEmbedding, Embedding](
       wq: Tensor3[Head, Embedding, HeadQuery, Float],
       wk: Tensor3[Head, CrossEmbedding, HeadKey, Float],
       wv: Tensor3[Head, CrossEmbedding, HeadValue, Float],
@@ -244,6 +246,7 @@ object MultiHeadCrossAttention:
   )
 
   object Params:
+
     def defaultInit[CrossEmbedding: Label, Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CrossEmbedding], embeddingExtent: AxisExtent[Embedding]): MultiHeadCrossAttention.Params[CrossEmbedding, Embedding] =
       MultiHeadCrossAttention.Params(
         wq = Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headQueryExtent), scale = 0.02f).sample(key),
