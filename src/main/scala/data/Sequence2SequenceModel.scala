@@ -29,6 +29,7 @@ import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
 
 import java.sql.Time
 import resplan.nn.VisitionTransformer2DPatching
+import dimwit.stats.Bernoulli
 
 object Config:
   inline val numberOfEncoderLayers = 6
@@ -191,11 +192,7 @@ object Sequence2SequenceModelHyperParams:
     val keys = key.toSourceOfRandomness
     new Sequence2SequenceModelHyperParams(
       encoderTransformerLayer = TransformerLayer.HyperParams(
-        embeddingMixer = MLPEmbeddingMixer.HyperParams(
-          hiddenDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-          outputDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-          gelu
-        ),
+        embeddingMixer = MLPEmbeddingMixer.HyperParams(gelu),
         multiHeadAttention = MultiHeadAttention.HyperParams(
           SelfAttention.HyperParams(createAttentionMask = noMask)
         )
@@ -204,11 +201,7 @@ object Sequence2SequenceModelHyperParams:
         multiHeadCrossAttention = MultiHeadCrossAttention.HyperParams(
           CrossAttention.HyperParams(createAttentionMask = noMask)
         ),
-        embeddingMixer = MLPEmbeddingMixer.HyperParams(
-          hiddenDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-          outputDropout = DropoutLayer.HyperParams(0.1f, keys.next().toSourceOfRandomness, isTraining),
-          gelu
-        ),
+        embeddingMixer = MLPEmbeddingMixer.HyperParams(gelu),
         multiHeadAttention = MultiHeadAttention.HyperParams(
           SelfAttention.HyperParams(createAttentionMask = causalMask)
         )
@@ -233,7 +226,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
 @main def train(): Unit =
   scalaRandom.setSeed(42)
   val initialKey = Random.Key(42)
-  val (trainKey, valKey) = initialKey.split2()
+  val (trainDataKey, valDataKey, trainAugKey, initTrainKey, initModelKey) = initialKey.splitToTuple(5)
   val plans = scalaRandom.shuffle(ResPlanDataset.loadRawPlans())
   // Filter plans that do not fit in the configured context size
   val validPlans = plans.filter(plan => plan.graph.nodes.size + plan.graph.edges.size * 3 + 2 < decoderContextExtent.size)
@@ -250,7 +243,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       decoderContextExtent.size
     ),
     imageNormalization,
-    trainKey.toSourceOfRandomness,
+    trainDataKey.toSourceOfRandomness,
     inifinite = true
   )
   val valGraphLinearization = PaddedGraphLinearization(
@@ -263,7 +256,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     planImages,
     valGraphLinearization,
     imageNormalization,
-    valKey.toSourceOfRandomness,
+    valDataKey.toSourceOfRandomness,
     inifinite = false
   )
   val valSubset = valDataset.copy(plans = valPlans.take(32))
@@ -276,13 +269,13 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   val trainSampleStream = trainDataset
     .iterator
     .grouped(batchSize).withPartial(false)
-    .zip(trainKey.toSourceOfRandomness)
-    .map: (sample, trainKey) =>
+    .zip(trainAugKey.toSourceOfRandomness)
+    .map: (sample, trainAugKey) =>
       val imageBatch = zipvmap(Axis[Batch])(
         stack(sample.map(_.image), Axis[Batch]),
-        trainKey.splitToTensor(batchExtent)
-      ): (sample, key) =>
-        jitAugmentImage(sample, key)
+        trainAugKey.splitToTensor(batchExtent)
+      ): (sample, augKey) =>
+        jitAugmentImage(sample, augKey)
       val targetBatch = stack(sample.map(_.lineraizedGraph), Axis[Batch])
       BatchSample(imageBatch, targetBatch).toGPU
 
@@ -290,8 +283,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   for batch <- trainSampleStream do
     debugTimer.tick()
     println(f"s/batch: ${debugTimer.runningAvgSeconds}%.2f")*/
-
-  val initParams = Sequence2SequenceModelParams.init(Random.Key.fromTime())
+  val initParams = Sequence2SequenceModelParams.init(initModelKey)
 
   val adam = Adam(learningRate = learningRate, b1 = beta1, b2 = beta2, epsilon = 1e-8f)
   val adamW = AdamW(adam, weightDecayFactor = weightDecayFactor)
@@ -299,6 +291,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
 
   case class TrainingState(
       params: Sequence2SequenceModelParams,
+      trainKey: Random.Key,
       adamWState: AdamWState,
       loss: Tensor0[Float]
   )
@@ -317,17 +310,48 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     val batchLosses = zipvmap(Axis[Batch])(logits, targets)(loss)
     batchLosses.mean
 
+  def sampleSubnetwork(
+      params: Sequence2SequenceModelParams,
+      key: Random.Key,
+      mlpDropoutRate: Float = 0.1f
+  ): Sequence2SequenceModelParams =
+    val (encoderKey, decoderKey) = key.splitToTuple(2)
+    params.copy(
+      encoderLayers = params.encoderLayers.zip(encoderKey.toSourceOfRandomness).map:
+        case (params, k) =>
+          val (fcKey, projKey) = k.split2()
+          val keepProb = 1.0f - mlpDropoutRate
+          val fcDropoutMask = IndependentDistribution.fromUnivariate(params.mlpParams.c_fc.bias.shape, Bernoulli(Prob(keepProb))).sample(fcKey).asFloat *! (1f / (keepProb))
+          val projDropoutMask = IndependentDistribution.fromUnivariate(params.mlpParams.c_proj.bias.shape, Bernoulli(Prob(keepProb))).sample(projKey).asFloat *! (1f / (keepProb))
+          params.copy(
+            // attentionParams = ??? TODO attention dropout
+            mlpParams = params.mlpParams.copy(
+              c_fc = params.mlpParams.c_fc.copy(
+                weight = params.mlpParams.c_fc.weight *! fcDropoutMask,
+                bias = params.mlpParams.c_fc.bias * fcDropoutMask
+              ),
+              c_proj = params.mlpParams.c_proj.copy(
+                weight = params.mlpParams.c_proj.weight *! projDropoutMask,
+                bias = params.mlpParams.c_proj.bias * projDropoutMask
+              )
+            )
+          ),
+      decoderLayer = params.decoderLayer.zip(decoderKey.toSourceOfRandomness).map:
+        case (params, k) => params
+    )
+
   def gradientStep(
       imgs: Tensor[(Batch, Width, Height, Channel), Float],
       shiftedTargets: Tensor2[Batch, DecoderContext, Int],
       targets: Tensor2[Batch, DecoderContext, Int],
       state: TrainingState
   ): TrainingState =
+    val (nextKey, thisKey) = state.trainKey.split2()
     val lossBatch = batchLoss(imgs, shiftedTargets, targets)
-    val grads = Autodiff.grad(lossBatch)(state.params)
+    val grads = Autodiff.grad(lossBatch)(sampleSubnetwork(state.params, thisKey))
     val loss = lossBatch(state.params) // TODO move to gradAndValue
     val (params, adamWState) = adamW.update(grads, state.params, state.adamWState)
-    TrainingState(params = params, adamWState = adamWState, loss = loss)
+    TrainingState(params = params, trainKey = nextKey, adamWState = adamWState, loss = loss)
   val jitStep = jitDonatingUnsafe(gradientStep)
 
   def calcLogits(params: Sequence2SequenceModelParams, image: Tensor[(Width, Height, Channel), Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
@@ -384,7 +408,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       ).mkString(", ")
     )
 
-  val initState = TrainingState(initParams, adamW.init(initParams), Tensor0(-1f))
+  val initState = TrainingState(initParams, initTrainKey, adamW.init(initParams), Tensor0(-1f))
   val trainTrajectory = miniBatchGradientDescent(trainSampleStream, initState)
   val timer = Timer.start()
   println("Training...")

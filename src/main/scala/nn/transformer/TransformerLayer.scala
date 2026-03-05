@@ -2,7 +2,6 @@ package resplan.nn.transformer
 
 import dimwit.*
 import nn.ActivationFunctions.gelu
-import resplan.nn.base.DropoutLayer
 import resplan.nn.normalization.LayerNorm
 
 case class TransformerBlock[Context: Label, Embedding](layers: List[ITransformerLayer[Context, Embedding]]) extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):

@@ -4,35 +4,13 @@ import dimwit.*
 import dimwit.Conversions.given
 import nn.ActivationFunctions.softmax
 import dimwit.stats.Normal
-import resplan.nn.base.{DropoutLayer, AffineLayer, LinearLayer}
+import resplan.nn.base.{AffineLayer, LinearLayer}
 import resplan.nn.init.xavierNormal
 
 trait Query derives Label
 trait Key derives Label
 trait Value derives Label
 trait AttentionWeights derives Label
-
-object AttentionWeights:
-
-  def scaledDotProduct[Context: Label, CrossContext: Label, Q: Label, K: Label](
-      createAttentionMasking: Shape2[Context, CrossContext] => Tensor2[Context, CrossContext, Boolean]
-  )(
-      queries: Tensor2[Context, Q, Float],
-      keys: Tensor2[CrossContext, K, Float]
-  ): Tensor2[Context, AttentionWeights, Float] =
-    val contextExtent = queries.shape.extent(Axis[Context])
-    val dk = Math.sqrt(keys.shape(Axis[K])).toFloat
-    val attentionScores = queries.dot(Axis[Q ~ K])(keys) /! dk
-    val attentionWeights = where(createAttentionMasking(attentionScores.shape), attentionScores, Tensor.like(attentionScores).fill(Float.NegativeInfinity))
-      .vmap(Axis[Context])(attentionScore => softmax(attentionScore).relabelTo(Axis[AttentionWeights]))
-    attentionWeights
-
-  def queryKeyNormalization = ???
-
-  def withAttentionDropout[Context: Label, Embedding: Label](attentionDropoutParams: DropoutLayer.HyperParams[AttentionWeights])(innerCalculateAttentionWeights: (Tensor2[Context, Query, Float], Tensor2[Context, Key, Float]) => Tensor2[Context, AttentionWeights, Float])(queries: Tensor2[Context, Query, Float], keys: Tensor2[Context, Key, Float]): Tensor2[Context, AttentionWeights, Float] =
-    val attentionWeights = innerCalculateAttentionWeights(queries, keys)
-    val dropoutLayer = DropoutLayer(attentionDropoutParams)
-    attentionWeights.vmap(Axis[Context])(dropoutLayer)
 
 trait ISelfAttention[Context: Label, Embedding: Label, Q: Label, K: Label, V: Label] extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, V, Float]):
 

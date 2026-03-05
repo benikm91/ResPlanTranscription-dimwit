@@ -12,28 +12,18 @@ case class MLPEmbeddingMixer[Embedding: Label](
 
   private val hiddenLayer = AffineLayer(params.c_fc)
   private val outputLayer = AffineLayer(params.c_proj)
-  private val hiddenDropout = DropoutLayer(hyperParams.hiddenDropout)
-  private val outputDropout = DropoutLayer(hyperParams.outputDropout)
 
   override def apply(in: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
-    val hidden = hiddenDropout(gelu(hiddenLayer(in)))
-    outputDropout(outputLayer(hidden))
+    val hidden = gelu(hiddenLayer(in))
+    outputLayer(hidden)
 
 object MLPEmbeddingMixer:
 
   trait EmbeddingMixed derives Label
 
   case class HyperParams[Embedding](
-      hiddenDropout: DropoutLayer.HyperParams[EmbeddingMixed],
-      outputDropout: DropoutLayer.HyperParams[Embedding],
       activationFunction: Tensor[Tuple1[Embedding], Float] => Tensor[Tuple1[Embedding], Float]
   )
-
-  object HyperParams:
-    def apply[Embedding: Label](
-        hiddenDropout: DropoutLayer.HyperParams[EmbeddingMixed],
-        outputDropout: DropoutLayer.HyperParams[Embedding]
-    ) = new HyperParams(hiddenDropout, outputDropout, gelu)
 
   case class Params[Embedding](
       c_fc: AffineLayer.Params[Embedding, EmbeddingMixed],
