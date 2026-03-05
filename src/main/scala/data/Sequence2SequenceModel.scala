@@ -18,7 +18,7 @@ import resplan.util.PythonSetup
 import resplan.util.PythonHelper
 import resplan.nn.transformer.{noMask, causalMask}
 import resplan.nn.VocabularyEmbedder
-import resplan.nn.base.{DropoutLayer, LinearLayer}
+import resplan.nn.base.{LinearLayer, sampleThinAffineLayer}
 import resplan.nn.normalization.LayerNorm
 import resplan.nn.transformer.{SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention}
 import resplan.nn.transformer.{TransformerBlock, TransformerLayer, CrossTransformerLayer, CrossTransformerBlock, MLPEmbeddingMixer}
@@ -30,6 +30,7 @@ import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
 import java.sql.Time
 import resplan.nn.VisitionTransformer2DPatching
 import dimwit.stats.Bernoulli
+import resplan.nn.base.AffineLayer
 
 object Config:
   inline val numberOfEncoderLayers = 6
@@ -310,7 +311,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     val batchLosses = zipvmap(Axis[Batch])(logits, targets)(loss)
     batchLosses.mean
 
-  def sampleSubnetwork(
+  def sampleThinSubnetwork(
       params: Sequence2SequenceModelParams,
       key: Random.Key,
       mlpDropoutRate: Float = 0.1f
@@ -319,21 +320,12 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     params.copy(
       encoderLayers = params.encoderLayers.zip(encoderKey.toSourceOfRandomness).map:
         case (params, k) =>
-          val (fcKey, projKey) = k.split2()
-          val keepProb = 1.0f - mlpDropoutRate
-          val fcDropoutMask = IndependentDistribution.fromUnivariate(params.mlpParams.c_fc.bias.shape, Bernoulli(Prob(keepProb))).sample(fcKey).asFloat *! (1f / (keepProb))
-          val projDropoutMask = IndependentDistribution.fromUnivariate(params.mlpParams.c_proj.bias.shape, Bernoulli(Prob(keepProb))).sample(projKey).asFloat *! (1f / (keepProb))
+          val (expandKey, projectKey) = k.split2()
           params.copy(
             // attentionParams = ??? TODO attention dropout
             mlpParams = params.mlpParams.copy(
-              c_fc = params.mlpParams.c_fc.copy(
-                weight = params.mlpParams.c_fc.weight *! fcDropoutMask,
-                bias = params.mlpParams.c_fc.bias * fcDropoutMask
-              ),
-              c_proj = params.mlpParams.c_proj.copy(
-                weight = params.mlpParams.c_proj.weight *! projDropoutMask,
-                bias = params.mlpParams.c_proj.bias * projDropoutMask
-              )
+              expand = sampleThinAffineLayer(params.mlpParams.expand, 0.1f, expandKey),
+              project = sampleThinAffineLayer(params.mlpParams.project, 0.1f, projectKey)
             )
           ),
       decoderLayer = params.decoderLayer.zip(decoderKey.toSourceOfRandomness).map:
@@ -348,7 +340,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   ): TrainingState =
     val (nextKey, thisKey) = state.trainKey.split2()
     val lossBatch = batchLoss(imgs, shiftedTargets, targets)
-    val grads = Autodiff.grad(lossBatch)(sampleSubnetwork(state.params, thisKey))
+    val grads = Autodiff.grad(lossBatch)(sampleThinSubnetwork(state.params, thisKey))
     val loss = lossBatch(state.params) // TODO move to gradAndValue
     val (params, adamWState) = adamW.update(grads, state.params, state.adamWState)
     TrainingState(params = params, trainKey = nextKey, adamWState = adamWState, loss = loss)
