@@ -5,9 +5,9 @@ import nn.ActivationFunctions.gelu
 import resplan.nn.normalization.LayerNorm
 
 case class TransformerBlock[Context: Label, Embedding](layers: List[ITransformerLayer[Context, Embedding]]) extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
-  override def apply(t: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-    layers.foldLeft(t):
-      case (t, layer) => layer(t)
+  override def apply(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+    layers.foldLeft(context):
+      case (context_i, layer) => layer(context_i)
 
 trait ITransformerLayer[Context: Label, Embedding: Label] extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
 
@@ -20,7 +20,7 @@ trait ITransformerLayer[Context: Label, Embedding: Label] extends (Tensor2[Conte
     x = x + x.vmap(Axis[Context])(embeddingMixer)
     x
 
-trait TransformerLayer[Context: Label, Embedding: Label](
+class TransformerLayer[Context: Label, Embedding: Label](
     hyperParams: TransformerLayer.HyperParams[Context, Embedding]
 )(
     params: TransformerLayer.Params[Embedding]
@@ -32,34 +32,18 @@ trait TransformerLayer[Context: Label, Embedding: Label](
   val mlp = MLPEmbeddingMixer(hyperParams.embeddingMixer)(params.mlpParams)
   val mlpNorm = LayerNorm(params.mlpNormParams)
 
+  override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
+    val embNorm = mlpNorm(embeddings)
+    mlp(embNorm)
+
+  override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+    val contextNorm = context.vmap(Axis[Context])(selfAttentionNorm)
+    selfAttention(contextNorm)
+
 object TransformerLayer:
 
-  case class WithPreNorm[Context: Label, Embedding: Label](
-      hyperParams: TransformerLayer.HyperParams[Context, Embedding]
-  )(
-      params: TransformerLayer.Params[Embedding]
-  ) extends TransformerLayer[Context, Embedding](hyperParams)(params):
-
-    override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
-      val embNorm = mlpNorm(embeddings)
-      mlp(embNorm)
-
-    override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-      val contextNorm = context.vmap(Axis[Context])(selfAttentionNorm)
-      selfAttention(contextNorm)
-
-  case class WithPostNorm[Context: Label, Embedding: Label](
-      hyperParams: TransformerLayer.HyperParams[Context, Embedding]
-  )(
-      params: TransformerLayer.Params[Embedding]
-  ) extends TransformerLayer[Context, Embedding](hyperParams)(params):
-
-    override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
-      mlpNorm(mlp(embeddings))
-
-    override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-      val mixed = selfAttention(context)
-      mixed.vmap(Axis[Context])(selfAttentionNorm)
+  def apply[Context: Label, Embedding: Label](hyperParams: HyperParams[Context, Embedding])(params: Params[Embedding]): TransformerLayer[Context, Embedding] =
+    new TransformerLayer(hyperParams)(params)
 
   case class HyperParams[Context: Label, Embedding: Label](
       embeddingMixer: MLPEmbeddingMixer.HyperParams[Embedding],

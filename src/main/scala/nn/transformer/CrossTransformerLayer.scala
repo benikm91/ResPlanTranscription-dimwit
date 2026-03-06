@@ -9,7 +9,7 @@ case class CrossTransformerBlock[CrossContext: Label, CrossEmbedding, Context: L
 ) extends ((Tensor2[CrossContext, CrossEmbedding, Float], Tensor2[Context, Embedding, Float]) => Tensor2[Context, Embedding, Float]):
   override def apply(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
     layers.foldLeft(context):
-      case (t, layer) => layer(crossContext, context)
+      case (context_i, layer) => layer(crossContext, context_i)
 
 trait ICrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label] extends ((Tensor2[CrossContext, CrossEmbedding, Float], Tensor2[Context, Embedding, Float]) => Tensor2[Context, Embedding, Float]):
 
@@ -24,40 +24,34 @@ trait ICrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Context
     x = x + x.vmap(Axis[Context])(embeddingMixer)
     x
 
-trait CrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label](
+class CrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label](
     hyperParams: CrossTransformerLayer.HyperParams[CrossContext, Context, Embedding]
 )(
     params: CrossTransformerLayer.Params[CrossEmbedding, Embedding]
 ) extends ICrossTransformerLayer[CrossContext, CrossEmbedding, Context, Embedding]:
 
-  val selfAttention = MultiHeadAttention(hyperParams.multiHeadAttention)(params.selfAttentionParams)
-  val selfAttentionNorm = LayerNorm(params.selfAttentionNormParams)
+  private val selfAttention = MultiHeadAttention(hyperParams.multiHeadAttention)(params.selfAttentionParams)
+  private val selfAttentionPreNorm = LayerNorm(params.selfAttentionNormParams)
 
-  val crossAttention = new MultiHeadCrossAttention(hyperParams.multiHeadCrossAttention)(params.crossAttentionParams)
-  val crossAttentionNorm = LayerNorm(params.crossAttentionNormParams)
+  private val crossAttention = new MultiHeadCrossAttention(hyperParams.multiHeadCrossAttention)(params.crossAttentionParams)
+  private val crossAttentionPreNorm = LayerNorm(params.crossAttentionNormParams)
 
-  val mlp = MLPEmbeddingMixer(hyperParams.embeddingMixer)(params.mlpParams)
-  val mlpNorm = LayerNorm(params.mlpNormParams)
+  private val mlp = MLPEmbeddingMixer(hyperParams.embeddingMixer)(params.mlpParams)
+  private val mlpPreNorm = LayerNorm(params.mlpNormParams)
+
+  override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
+    mlp(mlpPreNorm(embeddings))
+
+  override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+    selfAttention(context.vmap(Axis[Context])(selfAttentionPreNorm))
+
+  override def crossContextMixer(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
+    crossAttention(crossContext, context.vmap(Axis[Context])(crossAttentionPreNorm))
 
 object CrossTransformerLayer:
 
-  case class WithPostNorm[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label](
-      hyperParams: CrossTransformerLayer.HyperParams[CrossContext, Context, Embedding]
-  )(
-      params: CrossTransformerLayer.Params[CrossEmbedding, Embedding]
-  ) extends CrossTransformerLayer[CrossContext, CrossEmbedding, Context, Embedding](hyperParams)(params):
-
-    override def contextMixer(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-      val mixed = selfAttention(context)
-      mixed.vmap(Axis[Context])(selfAttentionNorm)
-
-    override def crossContextMixer(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-      val mixed = crossAttention(crossContext, context)
-      mixed.vmap(Axis[Context])(crossAttentionNorm)
-
-    override def embeddingMixer(embeddings: Tensor1[Embedding, Float]): Tensor1[Embedding, Float] =
-      val mixed = mlp(embeddings)
-      mlpNorm(mixed)
+  def apply[CrossContext: Label, Context: Label, CrossEmbedding: Label, Embedding: Label](hyperParams: HyperParams[CrossContext, Context, Embedding])(params: Params[CrossEmbedding, Embedding]): CrossTransformerLayer[CrossContext, CrossEmbedding, Context, Embedding] =
+    new CrossTransformerLayer(hyperParams)(params)
 
   case class HyperParams[CrossContext: Label, Context: Label, Embedding: Label](
       embeddingMixer: MLPEmbeddingMixer.HyperParams[Embedding],
@@ -77,11 +71,11 @@ object CrossTransformerLayer:
   object Params:
 
     def defaultInit[CE: Label, E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CE], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[MLPEmbeddingMixer.EmbeddingMixed], numTransformerLayers: Int): Params[CE, E] =
-      val (attnKey, mixKey) = key.split2()
+      val (selfAttnKey, crossAttnKey, mixKey) = key.splitToTuple(3)
       new Params[CE, E](
-        crossAttentionParams = MultiHeadCrossAttention.Params.defaultInit(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, crossEmbeddingExtent, embeddingExtent),
+        crossAttentionParams = MultiHeadCrossAttention.Params.defaultInit(crossAttnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, crossEmbeddingExtent, embeddingExtent, numTransformerLayers),
         crossAttentionNormParams = LayerNorm.Params.defaultInit(embeddingExtent),
-        selfAttentionParams = MultiHeadAttention.Params.defaultInit(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, numTransformerLayers = numTransformerLayers),
+        selfAttentionParams = MultiHeadAttention.Params.defaultInit(selfAttnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, numTransformerLayers),
         selfAttentionNormParams = LayerNorm.Params.defaultInit(embeddingExtent),
         mlpParams = MLPEmbeddingMixer.Params.defaultInit(embeddingExtent, embeddingMixedExtent, mixKey),
         mlpNormParams = LayerNorm.Params.defaultInit(embeddingExtent)

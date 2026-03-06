@@ -60,6 +60,26 @@ import dimwit.python.PyBridge
 
   plt.figure(figsize = (15, 15))
   plt.subplot(numRows, numCols, 1)
+  plt.title("Samples")
+  for (i, s) <- (1 to 100).zip(dataset.iterator) do
+    plt.subplot(numRows, numCols, i)
+    plt.imshow(PyBridge.toPyTensor(s.image))
+  plt.tight_layout()
+  plt.show()
+
+  plt.figure(figsize = (15, 15))
+  plt.subplot(numRows, numCols, 1)
+  plt.title("Augmented samples")
+  for ((i, s), augKey) <- (1 to 100).zip(dataset.iterator).zip(Random.Key(42).toSourceOfRandomness) do
+    plt.subplot(numRows, numCols, i)
+    val augImage = ImageAugmentation(s.image, augKey)
+    plt.imshow(PyBridge.toPyTensor(augImage))
+  plt.tight_layout()
+  plt.show()
+
+  plt.figure(figsize = (15, 15))
+  plt.title("Augmented sample")
+  plt.subplot(numRows, numCols, 1)
   plt.imshow(PyBridge.toPyTensor(sample.image))
   for (i, augKey) <- (2 to totalAugs).zip(Random.Key(42).toSourceOfRandomness) do
     val augImage = ImageAugmentation(sample.image, augKey)

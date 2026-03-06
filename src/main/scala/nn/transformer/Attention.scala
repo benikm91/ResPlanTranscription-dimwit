@@ -185,6 +185,7 @@ object MultiHeadAttention:
         wv = stack(valueKey.split(nHeads).map(key => xavierNormal(Shape(embeddingExtent, headValueExtent), key)), Axis[Head]),
         headProjection = AffineLayer.Params(
           weight = xavierNormal(Shape(headExtent * headValueExtent, embeddingExtent), projectionKey) /! (2f * numTransformerLayers).sqrt,
+          // weight = Normal.standardIsotropic(Shape(headExtent * headValueExtent, embeddingExtent), scale = 0.02f).sample(projectionKey),
           bias = Tensor(Shape(embeddingExtent)).fill(0f)
         )
       )
@@ -227,13 +228,15 @@ object MultiHeadCrossAttention:
 
   object Params:
 
-    def defaultInit[CrossEmbedding: Label, Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CrossEmbedding], embeddingExtent: AxisExtent[Embedding]): MultiHeadCrossAttention.Params[CrossEmbedding, Embedding] =
+    def defaultInit[CrossEmbedding: Label, Embedding: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CrossEmbedding], embeddingExtent: AxisExtent[Embedding], numTransformerLayers: Int): MultiHeadCrossAttention.Params[CrossEmbedding, Embedding] =
+      val (queryKey, keyKey, valueKey, projectionKey) = key.splitToTuple(4)
       MultiHeadCrossAttention.Params(
-        wq = Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headQueryExtent), scale = 0.02f).sample(key),
-        wk = Normal.standardIsotropic(Shape(headExtent, crossEmbeddingExtent, headKeyExtent), scale = 0.02f).sample(key),
-        wv = Normal.standardIsotropic(Shape(headExtent, crossEmbeddingExtent, headValueExtent), scale = 0.02f).sample(key),
+        wq = Normal.standardIsotropic(Shape(headExtent, embeddingExtent, headQueryExtent), scale = 0.02f).sample(queryKey),
+        wk = Normal.standardIsotropic(Shape(headExtent, crossEmbeddingExtent, headKeyExtent), scale = 0.02f).sample(keyKey),
+        wv = Normal.standardIsotropic(Shape(headExtent, crossEmbeddingExtent, headValueExtent), scale = 0.02f).sample(valueKey),
         headProjection = AffineLayer.Params(
-          weight = Normal.standardIsotropic(Shape(headExtent * headValueExtent, embeddingExtent), scale = 0.02f).sample(key),
+          weight = xavierNormal(Shape(headExtent * headValueExtent, embeddingExtent), projectionKey) /! (2f * numTransformerLayers).sqrt,
+          // weight = Normal.standardIsotropic(Shape(headExtent * headValueExtent, embeddingExtent), scale = 0.02f).sample(projectionKey),
           bias = Tensor(Shape(embeddingExtent)).fill(0f)
         )
       )
