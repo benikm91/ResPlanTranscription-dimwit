@@ -277,13 +277,11 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     .grouped(batchSize).withPartial(false)
     .zip(trainAugKey.toSourceOfRandomness)
     .map: (sample, trainAugKey) =>
-      val imageBatch = stack(sample.map(_.image), Axis[Batch])
-      /*zipvmap(Axis[Batch])(
+      val imageBatch = zipvmap(Axis[Batch])(
         stack(sample.map(_.image), Axis[Batch]),
         trainAugKey.splitToTensor(batchExtent)
-      ):
-        (sampleImage, augKey) =>
-          jitAugmentImage(sampleImage, augKey)*/
+      ): (sampleImage, augKey) =>
+        jitAugmentImage(sampleImage, augKey)
       val targetBatch = stack(sample.map(_.lineraizedGraph), Axis[Batch])
       BatchSample(imageBatch, targetBatch).toGPU
 
