@@ -3,11 +3,7 @@ package resplan.nn.transformer
 import dimwit.*
 import nn.ActivationFunctions.gelu
 import resplan.nn.normalization.LayerNorm
-
-case class TransformerBlock[Context: Label, Embedding](layers: List[ITransformerLayer[Context, Embedding]]) extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
-  override def apply(context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-    layers.foldLeft(context):
-      case (context_i, layer) => layer(context_i)
+import resplan.nn.transformer.attention.{Head, HeadKey, HeadQuery, HeadValue, MultiHeadAttention}
 
 trait ITransformerLayer[Context: Label, Embedding: Label] extends (Tensor2[Context, Embedding, Float] => Tensor2[Context, Embedding, Float]):
 
@@ -59,11 +55,11 @@ object TransformerLayer:
 
   object Params:
 
-    def defaultInit[E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[MLPEmbeddingMixer.EmbeddingMixed], numTransformerLayers: Int): Params[E] =
-      val (attnKey, mixKey) = key.split2()
+    def xavierUniformDepthScaled[E: Label](numTransformerLayers: Int)(headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[MLPEmbeddingMixer.EmbeddingMixed], key: Random.Key): Params[E] =
+      val (attnKey, mixKey) = key.splitToTuple(2)
       new Params[E](
-        attentionParams = MultiHeadAttention.Params.defaultInit(attnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, numTransformerLayers = numTransformerLayers),
-        attentionNormParams = LayerNorm.Params.defaultInit(embeddingExtent),
-        mlpParams = MLPEmbeddingMixer.Params.defaultInit(embeddingExtent, embeddingMixedExtent, mixKey),
-        mlpNormParams = LayerNorm.Params.defaultInit(embeddingExtent)
+        attentionParams = MultiHeadAttention.Params.xavierUniformDepthScaled(numTransformerLayers)(headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, attnKey),
+        attentionNormParams = LayerNorm.Params.identity(embeddingExtent),
+        mlpParams = MLPEmbeddingMixer.Params.xavierUniform(embeddingExtent, embeddingMixedExtent, mixKey),
+        mlpNormParams = LayerNorm.Params.identity(embeddingExtent)
       )

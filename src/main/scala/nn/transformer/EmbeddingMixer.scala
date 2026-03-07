@@ -31,9 +31,17 @@ object MLPEmbeddingMixer:
   )
 
   object Params:
-    def defaultInit[Embedding: Label](embeddingExtent: AxisExtent[Embedding], embeddingMixedExtent: AxisExtent[EmbeddingMixed], key: Random.Key): Params[Embedding] =
-      val (fcKey, projKey) = key.split2()
+
+    def xavierNormal[Embedding: Label](embeddingExtent: AxisExtent[Embedding], embeddingMixedExtent: AxisExtent[EmbeddingMixed], key: Random.Key): Params[Embedding] =
+      val (fcKey, projKey) = key.splitToTuple(2)
       Params(
-        expand = AffineLayer.Params.defaultInit(embeddingExtent, embeddingMixedExtent, fcKey),
-        project = AffineLayer.Params.defaultInit(embeddingMixedExtent, embeddingExtent, projKey)
+        expand = AffineLayer.Params.xavierNormal(embeddingExtent, embeddingMixedExtent, fcKey),
+        project = AffineLayer.Params.xavierNormal(embeddingMixedExtent, embeddingExtent, projKey)
+      )
+
+    def xavierUniform[Embedding: Label](embeddingExtent: AxisExtent[Embedding], embeddingMixedExtent: AxisExtent[EmbeddingMixed], key: Random.Key): Params[Embedding] =
+      val (fcKey, projKey) = key.splitToTuple(2)
+      Params(
+        expand = AffineLayer.Params.xavierUniform(embeddingExtent, embeddingMixedExtent, fcKey),
+        project = AffineLayer.Params.xavierUniform(embeddingMixedExtent, embeddingExtent, projKey)
       )

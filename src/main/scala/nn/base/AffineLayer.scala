@@ -1,7 +1,7 @@
 package resplan.nn.base
 
 import dimwit.*
-import resplan.nn.init.xavierNormal
+import resplan.nn.init
 
 case class AffineLayer[In: Label, Out: Label](params: AffineLayer.Params[In, Out]) extends (Tensor1[In, Float] => Tensor1[Out, Float]):
   override def apply(x: Tensor1[In, Float]): Tensor1[Out, Float] =
@@ -14,8 +14,15 @@ object AffineLayer:
   )
 
   object Params:
-    def defaultInit[In: Label, Out: Label](inExtent: AxisExtent[In], outExtent: AxisExtent[Out], key: Random.Key): Params[In, Out] =
+
+    def xavierNormal[In: Label, Out: Label](inExtent: AxisExtent[In], outExtent: AxisExtent[Out], key: Random.Key, gain: Float = 1f): Params[In, Out] =
       Params(
-        weight = xavierNormal(Shape(inExtent, outExtent), key),
+        weight = init.xavierNormal(inExtent, outExtent, key, gain = gain),
+        bias = Tensor(Shape(outExtent)).fill(0f)
+      )
+
+    def xavierUniform[In: Label, Out: Label](inExtent: AxisExtent[In], outExtent: AxisExtent[Out], key: Random.Key, gain: Float = 1f): Params[In, Out] =
+      Params(
+        weight = init.xavierUniform(inExtent, outExtent, key, gain = gain),
         bias = Tensor(Shape(outExtent)).fill(0f)
       )

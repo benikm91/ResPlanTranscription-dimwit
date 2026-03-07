@@ -1,4 +1,4 @@
-package resplan.data
+package resplan.model
 
 import dimwit.*
 import dimwit.Conversions.given
@@ -10,33 +10,38 @@ import nn.AdamW
 import dimwit.stats.Normal
 import scala.util.Random as scalaRandom
 import scala.math.Numeric.Implicits.infixNumericOps
-import scala.concurrent.Future
-import scala.concurrent.ExecutionContext.Implicits.global
 import scala.compiletime.ops.double
 import dimwit.jax.Jax
 import resplan.util.PythonSetup
 import resplan.util.PythonHelper
-import resplan.nn.transformer.{noMask, causalMask}
+import resplan.nn.VisitionTransformer2DPatching
 import resplan.nn.VocabularyEmbedder
-import resplan.nn.base.{LinearLayer, sampleThinAffineLayer}
+import resplan.nn.base.LinearLayer
+import resplan.nn.regularization.{sampleThinAffineLayer, sampleThinProjection, sampleThinAbsolutePositionalEncoding, sampleThinVocabularyEmbedder}
 import resplan.nn.normalization.LayerNorm
 import resplan.nn.loss.crossEntropy
-import resplan.nn.transformer.{SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention}
+import resplan.nn.transformer.{identityMask, causalMask}
+import resplan.nn.transformer.attention.{SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention}
 import resplan.nn.transformer.{TransformerBlock, TransformerLayer, CrossTransformerLayer, CrossTransformerBlock, MLPEmbeddingMixer}
-import resplan.nn.transformer.{Head, HeadQuery, HeadKey, HeadValue}
+import resplan.nn.transformer.attention.{Head, HeadQuery, HeadKey, HeadValue}
 import resplan.nn.transformer.MLPEmbeddingMixer.EmbeddingMixed
 import dimwit.stats.Uniform
-import RandomUtil.toSourceOfRandomness
 import dimwit.hardware.DeviceBackend.GPU
 import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
 
+import resplan.util.IteratorUtil.*
+import resplan.util.RandomUtil.toSourceOfRandomness
+
 import java.sql.Time
-import resplan.nn.VisitionTransformer2DPatching
 import dimwit.stats.Bernoulli
 import resplan.nn.base.AffineLayer
+import resplan.nn.AddAbsolutePositionalEncoding
+
+import resplan.data.*
+
 object Config:
-  inline val numberOfEncoderLayers = 6
-  inline val numberOfDecoderLayers = 6
+  inline val numberOfEncoderLayers = 8
+  inline val numberOfDecoderLayers = 8
   inline val learningRate = 1e-4f
   inline val beta1 = 0.9f
   inline val beta2 = 0.99f
@@ -50,7 +55,8 @@ object Config:
   inline val validationSetSize = 512
 
   inline val numIterations = 1_000_000
-  inline val evaluationInterval = (10_240 / batchSize).toInt
+  inline val trainInterval = 1
+  inline val evalInterval = (10_240 / batchSize).toInt
 
   private inline def validateConfig: Unit =
     inline if embeddingExtent % numberOfHeads != 0 then
@@ -63,7 +69,6 @@ object Config:
   validateConfig
 
 import Config.*
-import IteratorUtil.*
 
 trait Vocab derives Label
 trait EncoderEmbedding derives Label
@@ -101,8 +106,8 @@ case class Sequence2SequenceModelParams(
     encoderFinalNorm: LayerNorm.Params[EncoderEmbedding],
     decoderLayer: List[CrossTransformerLayer.Params[EncoderEmbedding, DecoderEmbedding]],
     decoderFinalNorm: LayerNorm.Params[DecoderEmbedding],
-    vocabEmbedding: Tensor2[Vocab, DecoderEmbedding, Float],
-    positionalEmbeddings: Tensor2[DecoderContext, DecoderEmbedding, Float],
+    decoderEmbedderParams: VocabularyEmbedder.Params[Vocab, DecoderEmbedding],
+    decoderPositionalEncodingParams: AddAbsolutePositionalEncoding.Params[DecoderContext, DecoderEmbedding],
     patchingParams: VisitionTransformer2DPatching.Params[Width, Height, Channel, EncoderEmbedding],
     outputProjection: LinearLayer.Params[DecoderEmbedding, Vocab]
 ) derives ToPyTree
@@ -111,17 +116,13 @@ object Sequence2SequenceModelParams:
   def init(key: Random.Key): Sequence2SequenceModelParams =
     val (encoderLayersKey, decoderLayersKey, vocabEmbeddingKey, positionalEmbeddingKey, vitPatchingKey, outputProjectionKey) = key.splitToTuple(6)
 
-    val vocabScale = 1.0f / Math.sqrt(decoderEmbeddingExtent.size.toDouble).toFloat
-    val posScale = 1.0f / Math.sqrt(decoderEmbeddingExtent.size.toDouble).toFloat *! 0.01f
-
     Sequence2SequenceModelParams(
       encoderLayers = encoderLayersKey.split(numberOfEncoderLayers).map(encoderLayerKey =>
-        TransformerLayer.Params.defaultInit(encoderLayerKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, embeddingMixedExtent, numberOfEncoderLayers)
+        TransformerLayer.Params.xavierUniformDepthScaled(numberOfEncoderLayers)(headExtent, headQueryExtent, headKeyExtent, headValueExtent, encoderEmbeddingExtent, embeddingMixedExtent, encoderLayerKey)
       ).toList,
-      encoderFinalNorm = LayerNorm.Params.defaultInit(encoderEmbeddingExtent),
+      encoderFinalNorm = LayerNorm.Params.identity(encoderEmbeddingExtent),
       decoderLayer = decoderLayersKey.split(numberOfDecoderLayers).map(decoderLayerKey =>
-        CrossTransformerLayer.Params.defaultInit(
-          decoderLayerKey,
+        CrossTransformerLayer.Params.xavierUniformDepthScaled(numberOfDecoderLayers)(
           headExtent,
           headQueryExtent,
           headKeyExtent,
@@ -129,14 +130,14 @@ object Sequence2SequenceModelParams:
           encoderEmbeddingExtent,
           decoderEmbeddingExtent,
           embeddingMixedExtent,
-          numberOfDecoderLayers
+          decoderLayerKey
         )
       ).toList,
-      decoderFinalNorm = LayerNorm.Params.defaultInit(decoderEmbeddingExtent),
-      vocabEmbedding = Normal.standardIsotropic(Shape(vocabExtent, decoderEmbeddingExtent), scale = vocabScale).sample(vocabEmbeddingKey),
-      positionalEmbeddings = Normal.standardIsotropic(Shape(decoderContextExtent, decoderEmbeddingExtent), scale = posScale).sample(positionalEmbeddingKey),
-      patchingParams = VisitionTransformer2DPatching.Params.defaultInit(patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent, vitPatchingKey),
-      outputProjection = LinearLayer.Params.defaultInit(decoderEmbeddingExtent, vocabExtent, outputProjectionKey)
+      decoderFinalNorm = LayerNorm.Params.identity(decoderEmbeddingExtent),
+      decoderEmbedderParams = VocabularyEmbedder.Params.lecunUniform(vocabExtent, decoderEmbeddingExtent, vocabEmbeddingKey),
+      decoderPositionalEncodingParams = AddAbsolutePositionalEncoding.Params.lecunUniform(decoderContextExtent, decoderEmbeddingExtent, positionalEmbeddingKey),
+      patchingParams = VisitionTransformer2DPatching.Params.xavierUniform(patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent, vitPatchingKey),
+      outputProjection = LinearLayer.Params.xavierUniform(decoderEmbeddingExtent, vocabExtent, outputProjectionKey)
     )
 
 case class Sequence2SequenceModelHyperParams(
@@ -149,21 +150,23 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
   private val vitPatching = VisitionTransformer2DPatching(params.patchingParams)
   private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer(hyperParams.encoderTransformerLayer)))
   private val encoderFinalNorm = LayerNorm(params.encoderFinalNorm)
+
+  private val decoderEmbedder = VocabularyEmbedder(params.decoderEmbedderParams)
+  private val addDecoderPositionalEncoding = AddAbsolutePositionalEncoding(params.decoderPositionalEncodingParams)
   private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer(hyperParams.decoderCrossTransformerLayer)))
   private val decoderFinalNorm = LayerNorm(params.decoderFinalNorm)
-  private val embedder = VocabularyEmbedder(params.vocabEmbedding)
   private val outputLayer = LinearLayer(params.outputProjection)
 
   def encode(img: Tensor3[Width, Height, Channel, Float]): Tensor2[EncoderContext, EncoderEmbedding, Float] =
     val flatPatches = vitPatching(img)
-    val encoderInputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
-    val rawEncoderContext = encoder(encoderInputContext)
-    val finalEncoderContext = rawEncoderContext.vmap(Axis[EncoderContext])(encoderFinalNorm)
-    finalEncoderContext
+    val inputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
+    val rawContext = encoder(inputContext)
+    val finalContext = rawContext.vmap(Axis[EncoderContext])(encoderFinalNorm)
+    finalContext
 
   def decode(encoderContext: Tensor2[EncoderContext, EncoderEmbedding, Float], shiftedDecoderContext: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, DecoderEmbedding, Float] =
-    val inputContext = shiftedDecoderContext.vmap(Axis[DecoderContext])(embedder)
-    val rawContext = decoder(encoderContext, inputContext)
+    val inputContext = shiftedDecoderContext.vmap(Axis[DecoderContext])(decoderEmbedder)
+    val rawContext = decoder(encoderContext, addDecoderPositionalEncoding(inputContext))
     val finalContext = rawContext.vmap(Axis[DecoderContext])(decoderFinalNorm)
     finalContext
 
@@ -203,12 +206,12 @@ val hyperParams = new Sequence2SequenceModelHyperParams(
   encoderTransformerLayer = TransformerLayer.HyperParams(
     embeddingMixer = MLPEmbeddingMixer.HyperParams(gelu),
     multiHeadAttention = MultiHeadAttention.HyperParams(
-      SelfAttention.HyperParams(createAttentionMask = noMask)
+      SelfAttention.HyperParams(createAttentionMask = identityMask)
     )
   ),
   decoderCrossTransformerLayer = CrossTransformerLayer.HyperParams(
     multiHeadCrossAttention = MultiHeadCrossAttention.HyperParams(
-      CrossAttention.HyperParams(createAttentionMask = noMask)
+      CrossAttention.HyperParams(createAttentionMask = identityMask)
     ),
     embeddingMixer = MLPEmbeddingMixer.HyperParams(gelu),
     multiHeadAttention = MultiHeadAttention.HyperParams(
@@ -291,7 +294,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     println(f"s/batch: ${debugTimer.runningAvgSeconds}%.2f")*/
   val initParams = Sequence2SequenceModelParams.init(initModelKey)
 
-  val adam = Adam(learningRate = learningRate, b1 = beta1, b2 = beta2, epsilon = 1e-8f)
+  val adam = Adam(learningRate = learningRate, b1 = beta1, b2 = beta2)
   val adamW = AdamW(adam, weightDecayFactor = weightDecayFactor)
   type AdamWState = adamW.State[Sequence2SequenceModelParams]
 
@@ -320,15 +323,11 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       params: Sequence2SequenceModelParams,
       key: Random.Key
   ): Sequence2SequenceModelParams =
-    def sampleThinProjection[L1: Label, L2: Label](projMatrix: Tensor2[L1, L2, Float], dropoutRate: Float, key: Random.Key): Tensor2[L1, L2, Float] =
-      val keepProb = 1.0f - dropoutRate
-      val dropoutMask = IndependentDistribution.fromUnivariate(Shape1(projMatrix.shape.extent(Axis[L2])), Bernoulli(Prob(keepProb))).sample(key).asFloat *! (1f / (keepProb))
-      projMatrix *! dropoutMask
 
     val (embKey, posEmbKey, encoderKey, decoderKey) = key.splitToTuple(4)
     params.copy(
-      vocabEmbedding = sampleThinProjection(params.vocabEmbedding, dropout, embKey),
-      positionalEmbeddings = sampleThinProjection(params.positionalEmbeddings, dropout, posEmbKey),
+      decoderEmbedderParams = sampleThinVocabularyEmbedder(params.decoderEmbedderParams, dropout, embKey),
+      decoderPositionalEncodingParams = sampleThinAbsolutePositionalEncoding(params.decoderPositionalEncodingParams, dropout, posEmbKey),
       encoderLayers = params.encoderLayers.zip(encoderKey.toSourceOfRandomness).map:
         case (params, k) =>
           val (expandKey, projectKey, attentionKey) = k.splitToTuple(3)
@@ -368,7 +367,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       targets: Tensor2[Batch, DecoderContext, Int],
       state: TrainingState
   ): TrainingState =
-    val (nextKey, thisKey) = state.trainKey.split2()
+    val (nextKey, thisKey) = state.trainKey.splitToTuple(2)
     val lossBatch = batchLoss(imgs, shiftedTargets, targets)
     val grads = Autodiff.grad(lossBatch)(sampleThinSubnetwork(state.params, thisKey))
     val loss = lossBatch(state.params) // TODO move to gradAndValue
@@ -436,7 +435,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   println("Training...")
   val finalState = trainTrajectory
     .drop(1)
-    .tapEvery(1):
+    .tapEvery(trainInterval):
       case (state, iter) =>
         // Training report
         timer.tick()
@@ -449,7 +448,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
             f"loss: ${state.loss.item}%.2f"
           ).mkString(", ")
         )
-    .tapEvery(evaluationInterval):
+    .tapEvery(evalInterval):
       case (state, iter) =>
         // Evaluation Report
         println("Evaluation...")
@@ -461,8 +460,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
           ).toList
         printScores(scores, iter = iter)
         timer.reset()
-    .drop(numIterations - 1) // iterate to final iteration
-    .next()
+    .nextAfter(numIterations)
 
   val scores = valDataset.iterator
     .map(_.toGPU)

@@ -3,13 +3,7 @@ package resplan.nn.transformer
 import dimwit.*
 import nn.ActivationFunctions.gelu
 import resplan.nn.normalization.LayerNorm
-
-case class CrossTransformerBlock[CrossContext: Label, CrossEmbedding, Context: Label, Embedding](
-    layers: List[CrossTransformerLayer[CrossContext, CrossEmbedding, Context, Embedding]]
-) extends ((Tensor2[CrossContext, CrossEmbedding, Float], Tensor2[Context, Embedding, Float]) => Tensor2[Context, Embedding, Float]):
-  override def apply(crossContext: Tensor2[CrossContext, CrossEmbedding, Float], context: Tensor2[Context, Embedding, Float]): Tensor2[Context, Embedding, Float] =
-    layers.foldLeft(context):
-      case (context_i, layer) => layer(crossContext, context_i)
+import resplan.nn.transformer.attention.{Head, HeadKey, HeadQuery, HeadValue, MultiHeadAttention, MultiHeadCrossAttention}
 
 trait ICrossTransformerLayer[CrossContext: Label, CrossEmbedding: Label, Context: Label, Embedding: Label] extends ((Tensor2[CrossContext, CrossEmbedding, Float], Tensor2[Context, Embedding, Float]) => Tensor2[Context, Embedding, Float]):
 
@@ -70,13 +64,13 @@ object CrossTransformerLayer:
 
   object Params:
 
-    def defaultInit[CE: Label, E: Label](key: Random.Key, headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CE], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[MLPEmbeddingMixer.EmbeddingMixed], numTransformerLayers: Int): Params[CE, E] =
+    def xavierUniformDepthScaled[CE: Label, E: Label](numTransformerLayers: Int)(headExtent: AxisExtent[Head], headQueryExtent: AxisExtent[HeadQuery], headKeyExtent: AxisExtent[HeadKey], headValueExtent: AxisExtent[HeadValue], crossEmbeddingExtent: AxisExtent[CE], embeddingExtent: AxisExtent[E], embeddingMixedExtent: AxisExtent[MLPEmbeddingMixer.EmbeddingMixed], key: Random.Key): Params[CE, E] =
       val (selfAttnKey, crossAttnKey, mixKey) = key.splitToTuple(3)
       new Params[CE, E](
-        crossAttentionParams = MultiHeadCrossAttention.Params.defaultInit(crossAttnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, crossEmbeddingExtent, embeddingExtent, numTransformerLayers),
-        crossAttentionNormParams = LayerNorm.Params.defaultInit(embeddingExtent),
-        selfAttentionParams = MultiHeadAttention.Params.defaultInit(selfAttnKey, headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, numTransformerLayers),
-        selfAttentionNormParams = LayerNorm.Params.defaultInit(embeddingExtent),
-        mlpParams = MLPEmbeddingMixer.Params.defaultInit(embeddingExtent, embeddingMixedExtent, mixKey),
-        mlpNormParams = LayerNorm.Params.defaultInit(embeddingExtent)
+        crossAttentionParams = MultiHeadCrossAttention.Params.xavierUniformDepthScaled(numTransformerLayers)(headExtent, headQueryExtent, headKeyExtent, headValueExtent, crossEmbeddingExtent, embeddingExtent, crossAttnKey),
+        crossAttentionNormParams = LayerNorm.Params.identity(embeddingExtent),
+        selfAttentionParams = MultiHeadAttention.Params.xavierUniformDepthScaled(numTransformerLayers)(headExtent, headQueryExtent, headKeyExtent, headValueExtent, embeddingExtent, selfAttnKey),
+        selfAttentionNormParams = LayerNorm.Params.identity(embeddingExtent),
+        mlpParams = MLPEmbeddingMixer.Params.xavierUniform(embeddingExtent, embeddingMixedExtent, mixKey),
+        mlpNormParams = LayerNorm.Params.identity(embeddingExtent)
       )

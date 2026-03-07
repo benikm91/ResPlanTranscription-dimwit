@@ -12,45 +12,11 @@ import scala.util.Failure
 import scala.util.Success
 import dimwit.tensor.Tensor3
 import dimwit.tensor.Shape
-import RandomUtil.toSourceOfRandomness
-import scala.concurrent.Future
-import scala.concurrent.ExecutionContext
+import resplan.util.RandomUtil.toSourceOfRandomness
 import dimwit.hardware.DeviceBackend.GPU
 import dimwit.python.PyBridge.toPyTensor
-
-trait Data derives Label
-trait Width derives Label
-trait Height derives Label
-trait Channel derives Label
-trait Node derives Label
-trait Edge derives Label
-
-val paddingValue = -1
-
-enum NodeClass(val id: Int, val prefix: String):
-  case Living extends NodeClass(0, "living")
-  case Bedroom extends NodeClass(1, "bedroom")
-  case Bathroom extends NodeClass(2, "bathroom")
-  case Kitchen extends NodeClass(3, "kitchen")
-  case Door extends NodeClass(4, "door")
-  case Window extends NodeClass(5, "window")
-  case Wall extends NodeClass(6, "wall")
-  case FrontDoor extends NodeClass(7, "front_door")
-  case Balcony extends NodeClass(8, "balcony")
-  case EndOfNodes extends NodeClass(9, "<eon>")
-
-object NodeClass:
-  def fromName(nodeName: String): NodeClass =
-    val nodeClasses = NodeClass.values.toList
-    nodeClasses.find(nodeClass => nodeName.startsWith(nodeClass.prefix)).head
-
-enum EdgeClass(val id: Int, val name: String):
-  case Edge extends EdgeClass(10, "edge")
-  case EndOfEdges extends EdgeClass(11, "<eoe>")
-
-val BOS = 12
-
-val POS_OFFSET = 13
+import resplan.model.DecoderContext
+import resplan.util.RandomUtil
 
 def isIsomorphicTo(pred: Graph, target: Graph): Boolean =
   if pred.nodes.size != target.nodes.size || pred.edges.size != target.edges.size
@@ -228,7 +194,6 @@ case class PaddedGraphLinearization(
     catch
       case e: Throwable => Failure(e)
 
-type RawPlan = Map[String, py.Dynamic]
 case class RawEdge(fromNode: RawNode, toNode: RawNode, edgeClassName: String)
 case class RawNode(nodeName: String, nodeClass: NodeClass)
 

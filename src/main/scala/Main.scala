@@ -15,7 +15,7 @@ import me.shadaj.scalapy.py.SeqConverters
 import resplan.data.{Data, Width, Height, Channel}
 import dimwit.jax.Jax
 import resplan.data.ImageAugmentation
-import resplan.data.RandomUtil.toSourceOfRandomness
+import resplan.util.RandomUtil.toSourceOfRandomness
 import scala.concurrent.ExecutionContext.Implicits.global
 import dimwit.python.PyBridge
 

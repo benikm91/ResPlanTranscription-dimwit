@@ -3,10 +3,13 @@ package resplan.nn.init
 import dimwit.*
 import dimwit.Conversions.given
 import dimwit.stats.Normal
+import dimwit.stats.Uniform
 
-def xavierScale(fanIn: Int, fanOut: Int): Float =
-  Math.sqrt(2.0 / (fanIn + fanOut).toDouble).toFloat
+def xavierNormal[FanIn: Label, FanOut: Label](fanIn: AxisExtent[FanIn], fanOut: AxisExtent[FanOut], key: Random.Key, gain: Float = 1f): Tensor2[FanIn, FanOut, Float] =
+  val variance = Tensor0(2.0f / (fanIn.size + fanOut.size))
+  Normal.standardIsotropic(Shape(fanIn, fanOut), scale = gain * variance.sqrt).sample(key)
 
-def xavierNormal[FanIn: Label, FanOut: Label](shape: Shape2[FanIn, FanOut], key: Random.Key): Tensor2[FanIn, FanOut, Float] =
-  val scale = xavierScale(shape(Axis[FanIn]), shape(Axis[FanOut]))
-  Normal.standardIsotropic(shape, scale = scale).sample(key)
+def xavierUniform[FanIn: Label, FanOut: Label](fanIn: AxisExtent[FanIn], fanOut: AxisExtent[FanOut], key: Random.Key, gain: Float = 1f): Tensor2[FanIn, FanOut, Float] =
+  val variance = Tensor0(2.0f / (fanIn.size + fanOut.size))
+  val a = gain * (3f * variance).sqrt
+  IndependentDistribution.fromUnivariate(Shape(fanIn, fanOut), Uniform(-a, a)).sample(key)

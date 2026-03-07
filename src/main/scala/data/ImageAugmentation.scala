@@ -13,9 +13,9 @@ object ImageAugmentation:
   import me.shadaj.scalapy.py
   private val jaxImage = py.module("jax.image")
 
-  private trait A derives Label
-  private val zoomFactorDist = IndependentDistribution.fromUnivariate((Shape1(Axis[A] -> 2)), Uniform(0.8f, 1.2f))
-  private val relShiftDist = IndependentDistribution.fromUnivariate((Shape1(Axis[A] -> 2)), Uniform(-0.05f, 0.05f))
+  private trait XY derives Label
+  private val zoomFactorDist = IndependentDistribution.fromUnivariate((Shape1(Axis[XY] -> 2)), Uniform(0.8f, 1.2f))
+  private val relShiftDist = IndependentDistribution.fromUnivariate((Shape1(Axis[XY] -> 2)), Uniform(-0.05f, 0.05f))
   private val flipHDist = Bernoulli(Prob(0.5f))
   private val flipVDist = Bernoulli(Prob(0.5f))
   private val rotationAngleDist = Uniform(Tensor0(0), Tensor0(3))
@@ -25,7 +25,7 @@ object ImageAugmentation:
     val width = image.shape(Axis[Width]).toFloat
     val height = image.shape(Axis[Height]).toFloat
     val zoomFactor = zoomFactorDist.sample(zoomFactorKey)
-    val dim = Tensor1(Axis[A]).fromArray(Array(width, height))
+    val dim = Tensor1(Axis[XY]).fromArray(Array(width, height))
     val shift = dim * relShiftDist.sample(relShiftKey)
     val center = dim /! 2f
     val totalTranslation = center - (center / zoomFactor) + shift

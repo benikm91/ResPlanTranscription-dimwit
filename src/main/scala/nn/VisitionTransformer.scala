@@ -4,7 +4,7 @@ import dimwit.*
 import dimwit.Conversions.given
 import nn.Conv2DLayer
 import dimwit.stats.Normal
-import resplan.nn.init.xavierNormal
+import resplan.nn.init
 
 trait IVisitionTransformer2DPatching[
     Width: Label,
@@ -66,12 +66,11 @@ object VisitionTransformer2DPatching:
   )
 
   object Params:
-    def defaultInit[PatchWidth: Label, PatchHeight: Label, Channel: Label, PatchEmbedding: Label](patchWidthExtent: AxisExtent[PatchWidth], patchHeightExtent: AxisExtent[PatchHeight], channelExtent: AxisExtent[Channel], embeddingExtent: AxisExtent[PatchEmbedding], key: Random.Key): Params[PatchWidth, PatchHeight, Channel, PatchEmbedding] =
-      val flatProjectionWeights = xavierNormal(
-        Shape2(
-          patchWidthExtent * patchHeightExtent * channelExtent,
-          embeddingExtent
-        ),
+
+    def xavierUniform[PatchWidth: Label, PatchHeight: Label, Channel: Label, PatchEmbedding: Label](patchWidthExtent: AxisExtent[PatchWidth], patchHeightExtent: AxisExtent[PatchHeight], channelExtent: AxisExtent[Channel], embeddingExtent: AxisExtent[PatchEmbedding], key: Random.Key): Params[PatchWidth, PatchHeight, Channel, PatchEmbedding] =
+      val flatProjectionWeights = init.xavierUniform(
+        patchWidthExtent * patchHeightExtent * channelExtent,
+        embeddingExtent,
         key
       )
       val projectionWeights = flatProjectionWeights.unflatten(
