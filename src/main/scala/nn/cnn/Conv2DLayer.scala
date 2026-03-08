@@ -3,6 +3,8 @@ package resplan.nn.cnn
 import dimwit.*
 import resplan.nn.init
 
+trait Conv2DLayer[S1: Label, S2: Label, InChannel: Label, OutChannel: Label] extends (Tensor[S1 *: S2 *: InChannel *: EmptyTuple, Float] => Tensor[S1 *: S2 *: OutChannel *: EmptyTuple, Float])
+
 object Conv2DLayer:
 
   case class HyperParams[S1, S2](

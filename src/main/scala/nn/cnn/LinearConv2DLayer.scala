@@ -10,9 +10,9 @@ case class LinearConv2DLayer[S1: Label, S2: Label, InChannel: Label, OutChannel:
     hyperParams: Conv2DLayer.HyperParams[S1, S2]
 )(
     params: LinearConv2DLayer.Params[S1, S2, InChannel, OutChannel]
-):
+) extends Conv2DLayer[S1, S2, InChannel, OutChannel]:
 
-  def apply(x: Tensor[S1 *: S2 *: InChannel *: EmptyTuple, Float]): Tensor[S1 *: S2 *: OutChannel *: EmptyTuple, Float] =
+  override def apply(x: Tensor[S1 *: S2 *: InChannel *: EmptyTuple, Float]): Tensor[S1 *: S2 *: OutChannel *: EmptyTuple, Float] =
     x.conv2d(params.kernel, hyperParams.stride, hyperParams.padding)
 
 object LinearConv2DLayer:
