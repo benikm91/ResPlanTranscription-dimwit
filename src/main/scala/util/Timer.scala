@@ -1,4 +1,4 @@
-package resplan.data
+package resplan.util
 
 case class Timer private (
     private val decay: Float = 0.01f

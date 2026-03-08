@@ -1,12 +1,11 @@
-package resplan.nn
+package resplan.nn.embedder
 
 import dimwit.*
 import dimwit.Conversions.given
-import nn.Conv2DLayer
+import resplan.nn.cnn.AffineConv2DLayer
 import dimwit.stats.Normal
-import resplan.nn.init
 
-trait IVisitionTransformer2DPatching[
+trait IImageToPatchEmbedder[
     Width: Label,
     Height: Label,
     Channel: Label,
@@ -21,19 +20,22 @@ trait IVisitionTransformer2DPatching[
     val patchesPos = patches + positionalEncoding2D(patches.shape)
     patchesPos.flatten((Axis[Width], Axis[Height]))
 
-case class VisitionTransformer2DPatching[
+case class ConvImageToPatchEmbedder[
     Width: Label,
     Height: Label,
     Channel: Label,
     PatchEmbedding: Label
 ](
-    params: VisitionTransformer2DPatching.Params[Width, Height, Channel, PatchEmbedding]
-) extends IVisitionTransformer2DPatching[Width, Height, Channel, PatchEmbedding]:
+    params: ConvImageToPatchEmbedder.Params[Width, Height, Channel, PatchEmbedding]
+) extends IImageToPatchEmbedder[Width, Height, Channel, PatchEmbedding]:
+
+  private val convLayer =
+    val kernelShape = params.conv.kernel.shape
+    val kernelSize = (kernelShape.extent(Axis[Width]), kernelShape.extent(Axis[Height]))
+    AffineConv2DLayer(AffineConv2DLayer.HyperParams(stride = kernelSize))(params.conv)
 
   override def encodeToPatches(img: Tensor[(Width, Height, Channel), Float]): Tensor[(Width, Height, PatchEmbedding), Float] =
-    val weightShape = params.projectionWeights.shape
-    val kernelSize = (weightShape.extent(Axis[Width]), weightShape.extent(Axis[Height]))
-    Conv2DLayer(Conv2DLayer.Params(params.projectionWeights), stride = kernelSize)(img)
+    convLayer(img)
 
   override def positionalEncoding2D(shape: Shape3[Width, Height, PatchEmbedding]): Tensor3[Width, Height, PatchEmbedding, Float] =
     // 1. Prepare things we need for positional encoding
@@ -59,22 +61,13 @@ case class VisitionTransformer2DPatching[
 
     concatenate(widthPosGrid, heightPosGrid, concatAxis = Axis[PatchEmbedding])
 
-object VisitionTransformer2DPatching:
+object ConvImageToPatchEmbedder:
 
   case class Params[PatchWidth, PatchHeight, Channel, PatchEmbedding](
-      projectionWeights: Tensor[(PatchWidth, PatchHeight, Channel, PatchEmbedding), Float]
+      conv: AffineConv2DLayer.Params[PatchWidth, PatchHeight, Channel, PatchEmbedding]
   )
 
   object Params:
 
     def xavierUniform[PatchWidth: Label, PatchHeight: Label, Channel: Label, PatchEmbedding: Label](patchWidthExtent: AxisExtent[PatchWidth], patchHeightExtent: AxisExtent[PatchHeight], channelExtent: AxisExtent[Channel], embeddingExtent: AxisExtent[PatchEmbedding], key: Random.Key): Params[PatchWidth, PatchHeight, Channel, PatchEmbedding] =
-      val flatProjectionWeights = init.xavierUniform(
-        patchWidthExtent * patchHeightExtent * channelExtent,
-        embeddingExtent,
-        key
-      )
-      val projectionWeights = flatProjectionWeights.unflatten(
-        Axis[PatchWidth |*| PatchHeight |*| Channel],
-        Shape(patchWidthExtent, patchHeightExtent, channelExtent)
-      )
-      Params(projectionWeights = projectionWeights)
+      Params(conv = AffineConv2DLayer.Params.xavierUniform(patchWidthExtent, patchHeightExtent, channelExtent, embeddingExtent, key))

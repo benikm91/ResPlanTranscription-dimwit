@@ -14,10 +14,10 @@ import scala.compiletime.ops.double
 import dimwit.jax.Jax
 import resplan.util.PythonSetup
 import resplan.util.PythonHelper
-import resplan.nn.VisitionTransformer2DPatching
-import resplan.nn.VocabularyEmbedder
+import resplan.nn.embedder.ConvImageToPatchEmbedder
+import resplan.nn.embedder.VocabularyEmbedder
 import resplan.nn.base.LinearLayer
-import resplan.nn.regularization.{sampleThinAffineLayer, sampleThinProjection, sampleThinAbsolutePositionalEncoding, sampleThinVocabularyEmbedder}
+import resplan.nn.regularization.{sampleThinAffineLayer, sampleThinProjection, sampleThinLearnedAbsolutePositionalInjector, sampleThinVocabularyEmbedder}
 import resplan.nn.normalization.LayerNorm
 import resplan.nn.loss.crossEntropy
 import resplan.nn.transformer.{identityMask, causalMask}
@@ -29,13 +29,14 @@ import dimwit.stats.Uniform
 import dimwit.hardware.DeviceBackend.GPU
 import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
 
+import resplan.util.Timer
 import resplan.util.IteratorUtil.*
 import resplan.util.RandomUtil.toSourceOfRandomness
 
 import java.sql.Time
 import dimwit.stats.Bernoulli
 import resplan.nn.base.AffineLayer
-import resplan.nn.AddAbsolutePositionalEncoding
+import resplan.nn.embedder.LearnedAbsolutePositionalInjector
 
 import resplan.data.*
 
@@ -107,8 +108,8 @@ case class Sequence2SequenceModelParams(
     decoderLayer: List[CrossTransformerLayer.Params[EncoderEmbedding, DecoderEmbedding]],
     decoderFinalNorm: LayerNorm.Params[DecoderEmbedding],
     decoderEmbedderParams: VocabularyEmbedder.Params[Vocab, DecoderEmbedding],
-    decoderPositionalEncodingParams: AddAbsolutePositionalEncoding.Params[DecoderContext, DecoderEmbedding],
-    patchingParams: VisitionTransformer2DPatching.Params[Width, Height, Channel, EncoderEmbedding],
+    decoderPositionalInjectorParams: LearnedAbsolutePositionalInjector.Params[DecoderContext, DecoderEmbedding],
+    patchingParams: ConvImageToPatchEmbedder.Params[Width, Height, Channel, EncoderEmbedding],
     outputProjection: LinearLayer.Params[DecoderEmbedding, Vocab]
 ) derives ToPyTree
 
@@ -135,8 +136,8 @@ object Sequence2SequenceModelParams:
       ).toList,
       decoderFinalNorm = LayerNorm.Params.identity(decoderEmbeddingExtent),
       decoderEmbedderParams = VocabularyEmbedder.Params.lecunUniform(vocabExtent, decoderEmbeddingExtent, vocabEmbeddingKey),
-      decoderPositionalEncodingParams = AddAbsolutePositionalEncoding.Params.lecunUniform(decoderContextExtent, decoderEmbeddingExtent, positionalEmbeddingKey),
-      patchingParams = VisitionTransformer2DPatching.Params.xavierUniform(patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent, vitPatchingKey),
+      decoderPositionalInjectorParams = LearnedAbsolutePositionalInjector.Params.lecunUniform(decoderContextExtent, decoderEmbeddingExtent, positionalEmbeddingKey),
+      patchingParams = ConvImageToPatchEmbedder.Params.xavierUniform(patchWidthExtent, patchHeightExtent, channelExtent, encoderEmbeddingExtent, vitPatchingKey),
       outputProjection = LinearLayer.Params.xavierUniform(decoderEmbeddingExtent, vocabExtent, outputProjectionKey)
     )
 
@@ -147,12 +148,12 @@ case class Sequence2SequenceModelHyperParams(
 
 case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyperParams)(params: Sequence2SequenceModelParams):
 
-  private val vitPatching = VisitionTransformer2DPatching(params.patchingParams)
+  private val vitPatching = ConvImageToPatchEmbedder(params.patchingParams)
   private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer(hyperParams.encoderTransformerLayer)))
   private val encoderFinalNorm = LayerNorm(params.encoderFinalNorm)
 
   private val decoderEmbedder = VocabularyEmbedder(params.decoderEmbedderParams)
-  private val addDecoderPositionalEncoding = AddAbsolutePositionalEncoding(params.decoderPositionalEncodingParams)
+  private val addDecoderPositionalEncoding = LearnedAbsolutePositionalInjector(params.decoderPositionalInjectorParams)
   private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer(hyperParams.decoderCrossTransformerLayer)))
   private val decoderFinalNorm = LayerNorm(params.decoderFinalNorm)
   private val outputLayer = LinearLayer(params.outputProjection)
@@ -327,7 +328,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     val (embKey, posEmbKey, encoderKey, decoderKey) = key.splitToTuple(4)
     params.copy(
       decoderEmbedderParams = sampleThinVocabularyEmbedder(params.decoderEmbedderParams, dropout, embKey),
-      decoderPositionalEncodingParams = sampleThinAbsolutePositionalEncoding(params.decoderPositionalEncodingParams, dropout, posEmbKey),
+      decoderPositionalInjectorParams = sampleThinLearnedAbsolutePositionalInjector(params.decoderPositionalInjectorParams, dropout, posEmbKey),
       encoderLayers = params.encoderLayers.zip(encoderKey.toSourceOfRandomness).map:
         case (params, k) =>
           val (expandKey, projectKey, attentionKey) = k.splitToTuple(3)
