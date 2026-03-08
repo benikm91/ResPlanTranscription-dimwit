@@ -1,49 +1,58 @@
 # DeepWit
 
-This document illustrates the concepts behind DeepWit, a deep learning library based on DimWit.
+This document illustrates the core concepts behind DeepWit, a deep learning library built on top of DimWit.
 
-## Design Philosophie
+## Design Philosophy
 
-We share DimWit's Vision to put human understanding first.
-For deep learning, this means breaking with the tradition to make lots of concepts in code implicit, and force the user to explicitly define them - to make the code align with the theory.
+We share DimWit's vision: **put human understanding first.** 
+In the context of a deep learning library, this means breaking away from the tradition of hiding concepts behind opaque, internal state or side effects.
+Instead, DeepWit forces the user to be more explicit, to bring the code into tight alignment with the underlying theory.
+This transparency also has a highly practical benefit: when the foundational concepts are explicit, building and understanding advanced techniques on top of them becomes significantly easier to reason about.
 
-### The Case against Implicit Concepts in Code
+### The Cost of Hidden Concepts
 
-Implicit concepts in code means that code has opaque side effects not visible by looking at it. To understand the code and link it to theory, many implementation specific details must be known by a reader.
+Many libraries hide core concepts internally to make user code more compact, but at the cost of transparency.
+To understand what the code is doing and link it back to theory, a reader must memorize framework-specific details. 
+This forces the user to learn two disconnected things: the actual theoretical concepts, and the implementation specifics.
 
-A straightforward examples is PyTorch's automatic differentiation and backprop implementation:
+To illustrate this disconnect between theory and code, consider PyTorch's approach to automatic differentiation (backprop):
 ```python
-loss = ... # Calculate loss
-loss.backward()  # (1) Run reverse automatic differentiation (backprop) and set grad internally in the tensor objects.
-optimizer.step() # (2) Apply gradients inside the tensor objects to the parameter values.
+# Setup: We have some code calculating the loss
+loss = ...
+# (1) Run backprop and set gradients internally in tensor objects.
+loss.backward()
+# (2) Apply gradients inside the tensor objects to the parameter values.
+optimizer.step()
 ```
-Note that the comments for (1) and (2) must be known beforehand to understand what is actually happening in these statements. There is no indication what is being optimized and that gradient-based learning takes place. 
+Without prior knowledge of the framework, it is impossible to deduce what happens under the hood at (1) and (2). Looking solely at the syntax, there is no indication of what is being optimized, or even that gradient-based learning is occurring.
 
-The same in DeepWit would look like this:
-
+The equivalent in DeepWit looks like this:
 ```scala
-def lossF(...) // Define loss function
-val grads = Autodiff.grad(lossF)(params) // (1) calculate gradients for all params 
-val nextParams = optimizer.update(grads, params) // apply gradients 
+// Setup: We have a function defining how to calculate the loss
+def lossF(...) = ...
+// (1) Run automatic differentiation to calculate the gradients.
+val grads = Autodiff.grad(lossF)(params)
+// (2) Apply gradients to parameters to get new parameters.
+val nextParams = optimizer.update(grads, params)
 ```
-Note that the gradients are explicitly represented, making the code align with the theory of gradient-based algorithms.
+Because we must explicitly represent the gradients and the parameters, the code naturally aligns with the theory of gradient-based learning.
 
-In practice implicit (basic) concepts leads to more implict concepts. For example, in PyTorch gradient accumulation, a straightforward concept in theory, can't be clearly expressed as no explicit gradients exist in the first place! Therefore, PyTorch "implements" this by calling `loss.backwards()` multiple times; again this must be known by a coder. It is implicit and hard to understand what is going on.
+Furthermore, having explicit gradients makes implementing custom training logic—like gradient accumulation—trivial. Instead of relying on additional, framework-specific workarounds, the user simply sums the explicit gradient values over multiple batches.
 
-### The case for Explicit Concepts in Code
+### The Beauty of Explicit Concepts
 
-In DeepWit we must express many concepts explicity. 
-While we have some extra work to implement basics, it makes the link to theory and the implementation for more complex concepts easier. Overall, this leads to better understanding of the theory and code itself. Putting human understanding first.
+In DeepWit, we embrace explicitness as a feature, not a burden. While defining concepts explicitly requires slightly more upfront code, the return on investment is massive: it demystifies complex architectures and tightly couples the implementation back to the theory.
 
-Breaking with the tradition of most existing deep learning libraries, in DeepWit we must explicitly represent learnable parameters, hyper parameters, random effects, ... TODO.
-In the following we discuss each in detail.
+Breaking with the tradition of most existing deep learning frameworks, DeepWit requires the user to, among others, represent learnable parameters as explicit data objects, pass hyperparameters in a separate parameter group, and handle random effects manually throughout the architecture (see Core Concepts in DeepWit).
+These design choices replace "framework magic" with a transparent implementation that remains highly aligned with the theory. In this directness, we find the beauty.
 
-#### Explicit Parameter Representation
+## Core Concepts in DeepWit
 
-We require the user to define an explicit parameter representation.
-While requiring extra code, it makes code closer to the deep learning theory. Especially, it makes implementations more transparent for concepts like weight initialization, parameter augmentation, checkpointing.
+### Explicit Parameter Representation
 
-Here an example for explicit parameter representation: `AffineLayer.Params[In, Out]` represents the parameters for the `AffineLayer` module. The module further defines initialization method that clearly define how parameters are initialized. A user must explicitly choose (or implement) an initialization method when creating an affine layer as part of a bigger architecture.
+DeepWit requires parameters to be defined as dedicated data objects. While this adds a small amount of boilerplate, it brings the code into closer alignment with theory. It makes the implementation entirely transparent for critical tasks like weight initialization, parameter augmentation, and checkpointing.
+
+For example, `AffineLayer.Params[In, Out]` represents the parameters for an affine layer. Because these are decoupled from the layer's logic, an explicit initialization method must be chosen at the time of creation. As the model's state is never hidden, tasks like checkpointing become as simple as storing the parameter data object.
 
 ```scala
 
@@ -54,38 +63,45 @@ object AffineLayer:
       bias: Tensor1[Out, Float]
   )
 
+  object Params:
+
+    def xavierNormal[In: Label, Out: Label](
+      inExtent: AxisExtent[In], outExtent: AxisExtent[Out], key: Random.Key
+    ): Params[In, Out] = Params(
+      weight = init.xavierNormal(inExtent, outExtent, key),
+      bias = Tensor(Shape(outExtent)).fill(0f)
+    )
+
+    def xavierUniform(...) = ...
+
 ```
 
-#### Explicit Model
+### Explicit Hyperparameter group
 
-All modules in DeepWit follow the same basic design: a _curried_ constructor takes a first group of its hyper-parameter(s), followed by a group of its parameters. The module itself extends a function.
-This aligns directly to the idea of a _model family_ and a _model_ from deep learning theory:
-1. Model Family (Architecture): Defined by hyperparameters (e.g., number of layers, activation functions, etc.)
-2. Concrete Model (Instance): Defined by trainable parameters (e.g., weights, biases, etc.)
-3. An instance is a black-box, mathematical function.
+DeepWit modules follow a curried constructor pattern that requires hyperparameters first, followed by parameters. This structural separation aligns the implementation with the theoretical transition from a model family to a mathematical function: Passing the hyperparameters fixes the "kind" of model, establishing the structure. Passing the parameters fixes the model's behavior to a concrete mathematical function.
 
 ```scala
-case class Model(
-    hyperParams: HyperParams // 1: Define model family (architecture)
-)(
-    params: Params           // 2: Define model (concrete model)
-) extends (In => Out)        // 3: Providing parameters results in a function
+case class Model
+// 1: Define "kind" of model 
+(hyperParams: HyperParams)
+// 2: Define behavior of model
+(params: Params)
+// 3: Results in a concrete function
+extends (In => Out):
+  override apply(in: In): Out = ...
 ```
 
-#### Explicit Randomness
+### Explicit Randomness
 
-We require the user to define randomness explicitly through DimWit's key concept (i.e., JAX key concept). 
-Most deep learning libraries like PyTorch, Tensorflow and even FLAX build on top of JAX, implement randomness in an implicit fashion by either relying on effectfull functions (e.g., `torch.rand()`) or global states (e.g., `flax.nnx.Rngs`). We break with this tradition.
+DeepWit treats stochasticity as an explicit capability rather than a hidden side effect, utilizing the Random Key concept (similar to JAX). This ensures that the presence—and absence—of randomness is clearly visible in the parameters of each module.
 
-If a architecture requires randomness, the user must explicitly take care of passing the keys for random effects to the layers and handle key splitting correctly inside the layers.
-This makes randomness explicit, and forces the user to take care of. Most architecture don't use randomness and in DeepWit this lack of randomness indicates determinism (at least on a conceptual level, disregarding randomness due to the technical stack).
-While dropout layer would add randomness during training to many common architectures, we implement dropout in DeepWit by parameter augmentation, making it part of the training algorithm not the architecture (see XXX).
+Most deep learning libraries—including PyTorch, TensorFlow, and even FLAX (built on top of JAX)—implement randomness in an implicit fashion by relying on effectful functions (e.g., torch.rand()) or global states (e.g., flax.nnx.Rngs). By breaking with this tradition, we ensure that a module's behavior is fully determined by its inputs. If a model is stochastic, its signature should say so.
 
-### Examples for downstream benefits
+## Downstream Benefits
 
 Making things explicit has several, non-obvious benefits. Here are some highlights to showcase the benefits of this design philosophy.
 
-#### Aligned Loss Functions
+### Mathematically Aligned Loss Functions
 
 Having explicit parameters allows one to define a loss function as it is mathematically defined, as a function from parameters to a scalar loss.
 Furthermore, we can define a more general loss function first taking the dataset (on which the loss in calculated) using Scala 3 function currying.
