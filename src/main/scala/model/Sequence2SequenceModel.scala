@@ -2,9 +2,8 @@ package resplan.model
 
 import dimwit.*
 import dimwit.Conversions.given
-import nn.ActivationFunctions.*
-import javax.xml.transform.Transformer
-import java.util.Base64.Decoder
+import deepwit.*
+import deepwit.labels.{Head, HeadQuery, HeadKey, HeadValue, EmbeddingMixed}
 import nn.Adam
 import nn.AdamW
 import dimwit.stats.Normal
@@ -14,17 +13,6 @@ import scala.compiletime.ops.double
 import dimwit.jax.Jax
 import resplan.util.PythonSetup
 import resplan.util.PythonHelper
-import resplan.nn.embedder.ConvImageToPatchEmbedder
-import resplan.nn.embedder.VocabularyEmbedder
-import resplan.nn.base.LinearLayer
-import resplan.nn.regularization.{sampleThinAffineLayer, sampleThinProjection, sampleThinLearnedAbsolutePositionalInjector, sampleThinVocabularyEmbedder}
-import resplan.nn.normalization.LayerNorm
-import resplan.nn.loss.crossEntropy
-import resplan.nn.transformer.{identityMask, causalMask}
-import resplan.nn.transformer.attention.{SelfAttention, MultiHeadAttention, MultiHeadCrossAttention, CrossAttention}
-import resplan.nn.transformer.{TransformerBlock, TransformerLayer, CrossTransformerLayer, CrossTransformerBlock, MLPEmbeddingMixer}
-import resplan.nn.transformer.attention.{Head, HeadQuery, HeadKey, HeadValue}
-import resplan.nn.transformer.MLPEmbeddingMixer.EmbeddingMixed
 import dimwit.stats.Uniform
 import dimwit.hardware.DeviceBackend.GPU
 import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
@@ -35,8 +23,6 @@ import resplan.util.RandomUtil.toSourceOfRandomness
 
 import java.sql.Time
 import dimwit.stats.Bernoulli
-import resplan.nn.base.AffineLayer
-import resplan.nn.embedder.LearnedAbsolutePositionalInjector
 
 import resplan.data.*
 
@@ -206,7 +192,7 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
 val hyperParams = new Sequence2SequenceModelHyperParams(
   encoderTransformerLayer = TransformerLayer.HyperParams(
     embeddingMixer = MLPEmbeddingMixer.HyperParams(gelu),
-    multiHeadAttention = MultiHeadAttention.HyperParams(
+    multiHeadAttention = MultiHeadSelfAttention.HyperParams(
       SelfAttention.HyperParams(createAttentionMask = identityMask)
     )
   ),
@@ -215,7 +201,7 @@ val hyperParams = new Sequence2SequenceModelHyperParams(
       CrossAttention.HyperParams(createAttentionMask = identityMask)
     ),
     embeddingMixer = MLPEmbeddingMixer.HyperParams(gelu),
-    multiHeadAttention = MultiHeadAttention.HyperParams(
+    multiHeadAttention = MultiHeadSelfAttention.HyperParams(
       SelfAttention.HyperParams(createAttentionMask = causalMask)
     )
   )
@@ -295,14 +281,15 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     println(f"s/batch: ${debugTimer.runningAvgSeconds}%.2f")*/
   val initParams = Sequence2SequenceModelParams.init(initModelKey)
 
-  val adam = Adam(learningRate = learningRate, b1 = beta1, b2 = beta2)
-  val adamW = AdamW(adam, weightDecayFactor = weightDecayFactor)
-  type AdamWState = adamW.State[Sequence2SequenceModelParams]
+  val adamW = AdamW(
+    Adam(learningRate = learningRate, b1 = beta1, b2 = beta2),
+    weightDecayFactor = weightDecayFactor
+  )
 
   case class TrainingState(
       params: Sequence2SequenceModelParams,
       trainKey: Random.Key,
-      adamWState: AdamWState,
+      adamWState: adamW.State[Sequence2SequenceModelParams],
       loss: Tensor0[Float]
   )
 

@@ -17,7 +17,8 @@ lazy val root = project
       "org.scalameta" %% "munit" % "1.0.0" % Test,
       "dev.scalapy" %% "scalapy-core" % "0.5.3",
       "ch.contrafactus" %% "dimwit-core" % "0.1.0-SNAPSHOT" changing (),
-      "ch.contrafactus" %% "dimwit-nn" % "0.1.0-SNAPSHOT" changing ()
+      "ch.contrafactus" %% "dimwit-nn" % "0.1.0-SNAPSHOT" changing (),
+      "deepwit" %% "deepwit-core" % "0.1.0-SNAPSHOT" changing ()
     ),
     Compile / resourceDirectory := baseDirectory.value / "src" / "main" / "resources",
     javaOptions ++= Seq(
