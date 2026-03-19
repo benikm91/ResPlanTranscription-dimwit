@@ -14,7 +14,7 @@ import dimwit.jax.Jax
 import resplan.util.PythonSetup
 import resplan.util.PythonHelper
 import dimwit.stats.Uniform
-import dimwit.hardware.DeviceBackend.GPU
+import dimwit.hardware.DeviceBackend.{CPU, GPU}
 import dimwit.python.PyBridge.{toPyTensor, liftPyTensor, liftPyTensor1}
 
 import resplan.util.Timer
@@ -25,6 +25,7 @@ import java.sql.Time
 import dimwit.stats.Bernoulli
 
 import resplan.data.*
+import scala.util.Try
 
 object Config:
   inline val numberOfEncoderLayers = 8
@@ -135,27 +136,21 @@ case class Sequence2SequenceModelHyperParams(
 case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyperParams)(params: Sequence2SequenceModelParams):
 
   private val patching = ConvImageToPatchEmbedder(params.patchingParams)
-  private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer(hyperParams.encoderTransformerLayer)))
-  private val encoderFinalNorm = LayerNorm(params.encoderFinalNorm)
+  private val encoder = Transformer(params.encoderLayers.map(TransformerLayer(hyperParams.encoderTransformerLayer)), LayerNorm(params.encoderFinalNorm))
 
   private val decoderEmbedder = VocabularyEmbedder(params.decoderEmbedderParams)
   private val addDecoderPositionalEncoding = LearnedAbsolutePositionalInjector(params.decoderPositionalInjectorParams)
-  private val decoder = CrossTransformerBlock(params.decoderLayer.map(CrossTransformerLayer(hyperParams.decoderCrossTransformerLayer)))
-  private val decoderFinalNorm = LayerNorm(params.decoderFinalNorm)
+  private val decoder = CrossTransformer(params.decoderLayer.map(CrossTransformerLayer(hyperParams.decoderCrossTransformerLayer)), LayerNorm(params.decoderFinalNorm))
   private val outputLayer = LinearLayer(params.outputProjection)
 
   def encode(img: Tensor3[Width, Height, Channel, Float]): Tensor2[EncoderContext, EncoderEmbedding, Float] =
     val flatPatches = patching(img)
     val inputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
-    val rawContext = encoder(inputContext)
-    val finalContext = rawContext.vmap(Axis[EncoderContext])(encoderFinalNorm)
-    finalContext
+    encoder(inputContext)
 
   def decode(encoderContext: Tensor2[EncoderContext, EncoderEmbedding, Float], shiftedDecoderContext: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, DecoderEmbedding, Float] =
     val inputContext = shiftedDecoderContext.vmap(Axis[DecoderContext])(decoderEmbedder)
-    val rawContext = decoder(encoderContext, addDecoderPositionalEncoding(inputContext))
-    val finalContext = rawContext.vmap(Axis[DecoderContext])(decoderFinalNorm)
-    finalContext
+    decoder(encoderContext, addDecoderPositionalEncoding(inputContext))
 
   def logits(img: Tensor3[Width, Height, Channel, Float], shiftedDecoderContext: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
     val encoderContext = encode(img)
@@ -167,6 +162,8 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
 
   def apply(img: Tensor3[Width, Height, Channel, Float], decoderContext: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
     logits(img, decoderContext).argmax(Axis[Vocab])
+
+  def newApply(img: Tensor3[Width, Height, Channel, Float]): Graph = ???
 
   def generate(img: Tensor3[Width, Height, Channel, Float]): Tensor1[DecoderContext, Int] =
     val encoderContext = encode(img)
@@ -210,7 +207,9 @@ val Sequence2SequenceModel = Sequence2SequenceModelFamily(hyperParams)
 
 case class BatchSample(image: Tensor[(Batch, Width, Height, Channel), Float], target: Tensor2[Batch, DecoderContext, Int]):
   def toGPU: BatchSample =
-    val gpuDevice = GPU.devices.head
+    val gpuDevice = Try(GPU.devices.head).getOrElse:
+      println("WARNING: No GPU found, using CPU instead.")
+      CPU.devices.headOption.getOrElse(throw new RuntimeException("No CPU found."))
     BatchSample(image.toDevice(gpuDevice), target.toDevice(gpuDevice))
 
 def shiftRight(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext, Int] =
@@ -265,15 +264,11 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   val trainSampleStream = trainDataset
     .iterator
     .grouped(batchSize).withPartial(false)
-    .zip(trainAugKey.toSourceOfRandomness)
-    .map: (sample, trainAugKey) =>
-      val imageBatch = zipvmap(Axis[Batch])(
-        stack(sample.map(_.image), Axis[Batch]),
-        trainAugKey.splitToTensor(batchExtent)
-      ): (sampleImage, augKey) =>
-        jitAugmentImage(sampleImage, augKey)
+    .zip(trainAugKey.toSourceOfRandomness).map: (sample, trainAugKey) =>
+      val imageBatch = stack(sample.map(_.image), Axis[Batch])
       val targetBatch = stack(sample.map(_.lineraizedGraph), Axis[Batch])
-      BatchSample(imageBatch, targetBatch).toGPU
+      val augmentedImageBatch = zipvmap(Axis[Batch])(imageBatch, trainAugKey.splitToTensor(batchExtent))(jitAugmentImage.tupled)
+      BatchSample(augmentedImageBatch, targetBatch).toGPU
 
   /*val debugTimer = Timer.start()
   for batch <- trainSampleStream do
@@ -326,10 +321,9 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       encoderLayers = params.encoderLayers.zip(encoderKey.toSourceOfRandomness).map:
         case (params, k) =>
           val (expandKey, projectKey, attentionKey) = k.splitToTuple(3)
-          val xxx = attentionKey.splitToTensor(headExtent)
           params.copy(
             attentionParams = params.attentionParams.copy(
-              wv = zipvmap(Axis[Head])(params.attentionParams.wv, xxx): (v, key) =>
+              wv = zipvmap(Axis[Head])(params.attentionParams.wv, attentionKey.splitToTensor(headExtent)): (v, key) =>
                 sampleThinProjection(v, dropout, key.item)
             ),
             mlpParams = params.mlpParams.copy(

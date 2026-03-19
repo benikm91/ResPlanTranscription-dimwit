@@ -13,7 +13,7 @@ import scala.util.Success
 import dimwit.tensor.Tensor3
 import dimwit.tensor.Shape
 import resplan.util.RandomUtil.toSourceOfRandomness
-import dimwit.hardware.DeviceBackend.GPU
+import dimwit.hardware.DeviceBackend.{CPU, GPU}
 import dimwit.python.PyBridge.toPyTensor
 import resplan.model.DecoderContext
 import resplan.util.RandomUtil
@@ -202,7 +202,9 @@ case class Graph(nodes: List[RawNode], edges: List[RawEdge])
 case class RawSample(imgPos: Int, graph: Graph)
 case class Sample(image: Tensor[(Width, Height, Channel), Float], lineraizedGraph: Tensor1[DecoderContext, Int]):
   def toGPU =
-    val deviceGPU = GPU.devices.head
+    val deviceGPU = Try(GPU.devices.head).getOrElse:
+      println("WARNING: No GPU found, using CPU instead.")
+      CPU.devices.headOption.getOrElse(throw new RuntimeException("No CPU found."))
     Sample(image.toDevice(deviceGPU), lineraizedGraph.toDevice(deviceGPU))
 
 object ResPlanDataset:
