@@ -134,7 +134,7 @@ case class Sequence2SequenceModelHyperParams(
 
 case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyperParams)(params: Sequence2SequenceModelParams):
 
-  private val vitPatching = ConvImageToPatchEmbedder(params.patchingParams)
+  private val patching = ConvImageToPatchEmbedder(params.patchingParams)
   private val encoder = TransformerBlock(params.encoderLayers.map(TransformerLayer(hyperParams.encoderTransformerLayer)))
   private val encoderFinalNorm = LayerNorm(params.encoderFinalNorm)
 
@@ -145,7 +145,7 @@ case class Sequence2SequenceModelFamily(hyperParams: Sequence2SequenceModelHyper
   private val outputLayer = LinearLayer(params.outputProjection)
 
   def encode(img: Tensor3[Width, Height, Channel, Float]): Tensor2[EncoderContext, EncoderEmbedding, Float] =
-    val flatPatches = vitPatching(img)
+    val flatPatches = patching(img)
     val inputContext = flatPatches.relabel(Axis[Width |*| Height].as(Axis[EncoderContext]))
     val rawContext = encoder(inputContext)
     val finalContext = rawContext.vmap(Axis[EncoderContext])(encoderFinalNorm)
@@ -287,10 +287,11 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
   )
 
   case class TrainingState(
+      step: Tensor0[Int],
       params: Sequence2SequenceModelParams,
       trainKey: Random.Key,
       adamWState: adamW.State[Sequence2SequenceModelParams],
-      loss: Tensor0[Float]
+      lastStepCost: Tensor0[Float]
   )
 
   def loss(logits: Tensor2[DecoderContext, Vocab, Float], targets: Tensor1[DecoderContext, Int]): Tensor0[Float] =
@@ -301,11 +302,17 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
     val zeros = Tensor(paddingMask.shape).fill(0f)
     where(paddingMask, lossPerContextPosition, zeros).sum / paddingMask.asFloat.sum
 
-  def batchLoss(imgs: Tensor[(Batch, Width, Height, Channel), Float], shiftedTargets: Tensor2[Batch, DecoderContext, Int], targets: Tensor2[Batch, DecoderContext, Int])(params: Sequence2SequenceModelParams): Tensor0[Float] =
+  def costFnFor[Sample: Label](
+      imgs: Tensor[(Sample, Width, Height, Channel), Float],
+      targets: Tensor2[Sample, DecoderContext, Int]
+  )(
+      params: Sequence2SequenceModelParams
+  ): Tensor0[Float] =
     val model = Sequence2SequenceModel(params)
-    val logits = zipvmap(Axis[Batch])(imgs, shiftedTargets)(model.logits)
-    val batchLosses = zipvmap(Axis[Batch])(logits, targets)(loss)
-    batchLosses.mean
+    val shiftedTargets = targets.vmap(Axis[Sample])(shiftRightBOS)
+    val logits = zipvmap(Axis[Sample])(imgs, shiftedTargets)(model.logits)
+    val sampleLosses = zipvmap(Axis[Sample])(logits, targets)(loss)
+    sampleLosses.mean
 
   def sampleThinSubnetwork(
       params: Sequence2SequenceModelParams,
@@ -349,27 +356,24 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
           )
     )
 
-  def gradientStep(
-      imgs: Tensor[(Batch, Width, Height, Channel), Float],
-      shiftedTargets: Tensor2[Batch, DecoderContext, Int],
-      targets: Tensor2[Batch, DecoderContext, Int],
+  def batchGradientDescentStep(
+      sample: BatchSample,
       state: TrainingState
   ): TrainingState =
     val (nextKey, thisKey) = state.trainKey.splitToTuple(2)
-    val lossBatch = batchLoss(imgs, shiftedTargets, targets)
-    val grads = Autodiff.grad(lossBatch)(sampleThinSubnetwork(state.params, thisKey))
-    val loss = lossBatch(state.params) // TODO move to gradAndValue
+    val costFn = costFnFor(sample.image, sample.target)
+    val grads = Autodiff.grad(costFn)(sampleThinSubnetwork(state.params, thisKey))
+    val stepCost = costFn(state.params) // TODO move to gradAndValue
     val (params, adamWState) = adamW.update(grads, state.params, state.adamWState)
-    TrainingState(params = params, trainKey = nextKey, adamWState = adamWState, loss = loss)
-  val jitStep = jitDonatingUnsafe(gradientStep)
+    TrainingState(step = state.step + 1, params = params, trainKey = nextKey, adamWState = adamWState, lastStepCost = stepCost)
+  val jitBatchGradientDescentStep = jitDonatingUnsafe(batchGradientDescentStep)
 
-  def calcLogits(params: Sequence2SequenceModelParams, image: Tensor[(Width, Height, Channel), Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
+  def predLogits(params: Sequence2SequenceModelParams, image: Tensor[(Width, Height, Channel), Float], shiftedTargets: Tensor1[DecoderContext, Int]): Tensor2[DecoderContext, Vocab, Float] =
     Sequence2SequenceModel(params).logits(image, shiftedTargets)
-  val jitLogits = eagerCleanup(calcLogits)
+  val jitPredLogits = eagerCleanup(predLogits)
 
   def generate(params: Sequence2SequenceModelParams, img: Tensor3[Width, Height, Channel, Float]): Tensor1[DecoderContext, Int] =
-    val model = Sequence2SequenceModel(params)
-    model.generate(img)
+    Sequence2SequenceModel(params).generate(img)
 
   val jitGenerate = jit(generate)
 
@@ -379,7 +383,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       graphLinearization: GraphLinearization
   ): (Tensor0[Float], GraphLinearizationScore) =
     val targets = sample.lineraizedGraph
-    val logits = jitLogits(params, sample.image, shiftRightBOS(targets))
+    val logits = jitPredLogits(params, sample.image, shiftRightBOS(targets))
     val valPredictionTeacherForcing = logits.argmax(Axis[Vocab])
     val valLoss = loss(logits, targets)
 
@@ -393,14 +397,14 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
 
     (valLoss, score)
 
-  def miniBatchGradientDescent(
+  def batchGradientDescent(
       samples: Iterator[BatchSample],
       startState: TrainingState
   ): Iterator[TrainingState] =
     samples.scanLeft(startState):
       case (state, sample) =>
         dimwit.gc()
-        jitStep(sample.image, sample.target.vmap(Axis[Batch])(shiftRightBOS), sample.target, state)
+        jitBatchGradientDescentStep(sample, state)
 
   def printScores(scores: List[(Float, GraphLinearizationScore)], iter: Int = -1): Unit =
     val macroValLoss = scores.map(_._1).sum / scores.size
@@ -417,8 +421,8 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
       ).mkString(", ")
     )
 
-  val initState = TrainingState(initParams, initTrainKey, adamW.init(initParams), Tensor0(-1f))
-  val trainTrajectory = miniBatchGradientDescent(trainSampleStream, initState)
+  val initState = TrainingState(0, initParams, initTrainKey, adamW.init(initParams), Tensor0(Float.NaN))
+  val trainTrajectory = batchGradientDescent(trainSampleStream, initState)
   val timer = Timer.start()
   println("Training...")
   val finalState = trainTrajectory
@@ -433,7 +437,7 @@ def shiftRightBOS(target: Tensor1[DecoderContext, Int]): Tensor1[DecoderContext,
             s"iter $iter",
             f"samples/s: ${batchSize / (secondsPerBatch)}%.2f",
             f"s/batch: $secondsPerBatch%.2f",
-            f"loss: ${state.loss.item}%.2f"
+            f"loss: ${state.lastStepCost.item}%.2f"
           ).mkString(", ")
         )
     .tapEvery(evalInterval):
